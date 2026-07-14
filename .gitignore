@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Qdrant Local Database
+qdrant_db/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
