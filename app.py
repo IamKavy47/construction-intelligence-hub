@@ -541,6 +541,102 @@ def ai_json(messages: List[Dict[str, str]], temperature: float = 0.2) -> Dict[st
     raise AgentUnavailable(f"AI JSON call failed. Last error: {last_err}")
 
 
+# =====================================================================================
+# GUARDRAILS — 3-layer topic filter (regex -> Groq classifier -> system-prompt wrapper)
+# Blocks off-topic queries instantly to protect token budget.
+# =====================================================================================
+import re
+from functools import lru_cache
+
+REFUSAL = (
+    "I'm the Construction Intelligence Hub assistant. I can only help with construction "
+    "topics: project timeline, materials, risks, safety, daily reports, weather impact, "
+    "site documents, standards, and codes. Please rephrase your question around the project."
+)
+
+GUARDRAIL_SYSTEM = (
+    "STRICT SCOPE: You ONLY answer questions about construction, civil engineering, "
+    "architecture, building materials, project management (timeline/cost/risk/safety), "
+    "site weather impact, and the uploaded project documents. If the user asks about "
+    "anything else (code help unrelated to construction, recipes, medicine, celebrities, "
+    "general trivia, politics, entertainment, personal advice), you MUST refuse with "
+    f"exactly this message and nothing else: \"{REFUSAL}\""
+)
+
+# Layer 0 — regex fast-path (0 tokens)
+_BLOCK_PATTERNS = re.compile(
+    r"\b(recipe|cook|bake|movie|song|lyrics|celebrity|actor|actress|"
+    r"politic|election|president|stock price|crypto|bitcoin|"
+    r"medicine|medical|diagnose|symptom|disease|"
+    r"dating|romance|relationship advice|"
+    r"write.*(poem|story|essay|novel)|"
+    r"python code|javascript code|leetcode|homework)\b",
+    re.IGNORECASE,
+)
+_ALLOW_PATTERNS = re.compile(
+    r"\b(construct|build|project|site|material|concrete|steel|rebar|cement|brick|"
+    r"timeline|schedule|gantt|task|milestone|risk|hazard|safety|ppe|osha|"
+    r"foundation|floor|roof|wall|column|beam|slab|window|door|gate|room|area|"
+    r"contractor|architect|engineer|blueprint|drawing|rfi|spec|code|standard|"
+    r"budget|cost|cpi|spi|delay|weather|rain|wind|storm|report|daily|inspection|"
+    r"procurement|supplier|estimate|quantity|takeoff|dashboard|copilot|kpi|alert)\b",
+    re.IGNORECASE,
+)
+
+def _regex_verdict(text: str) -> Optional[bool]:
+    """Return True=on-topic, False=off-topic, None=unsure."""
+    if _BLOCK_PATTERNS.search(text):
+        return False
+    if _ALLOW_PATTERNS.search(text):
+        return True
+    return None
+
+
+# Layer 1 — LangChain ChatGroq classifier (cheap, cached)
+@lru_cache(maxsize=512)
+def _groq_classify(text: str) -> bool:
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        # If Groq isn't available, be permissive (Layer 2 still guards output).
+        return True
+    try:
+        from langchain_groq import ChatGroq
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import PydanticOutputParser
+        from pydantic import BaseModel as PydBase, Field
+
+        class TopicCheck(PydBase):
+            on_topic: bool = Field(description="True if about construction/architecture/civil eng/project mgmt/site safety, else False")
+
+        parser = PydanticOutputParser(pydantic_object=TopicCheck)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "Classify if the user query is about construction, civil engineering, "
+             "architecture, building materials, project management (timeline/cost/risk/safety), "
+             "site weather, or uploaded construction documents. Reply ONLY as JSON.\n{fmt}"),
+            ("user", "{q}"),
+        ]).partial(fmt=parser.get_format_instructions())
+
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, groq_api_key=groq_key, max_tokens=80)
+        chain = prompt | llm | parser
+        result: TopicCheck = chain.invoke({"q": text})
+        return bool(result.on_topic)
+    except Exception as e:
+        logger.warning(f"Groq classifier failed, allowing through: {e}")
+        return True
+
+
+def is_on_topic(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    verdict = _regex_verdict(text)
+    if verdict is not None:
+        return verdict
+    return _groq_classify(text.strip().lower())
+
+
+
+
 # ===================== LANGGRAPH AGENT ================================================
 class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
@@ -555,6 +651,8 @@ def agent_node(state: GraphState):
         raise AgentUnavailable("No AI provider available (Mistral + Groq both missing).")
 
     system_prompt = SystemMessage(content=(
+        GUARDRAIL_SYSTEM + "\n\n"
+
         "You are the core AI engine of the Construction Intelligence Hub. The user is JD "
         "(Principal Architect). Active module: "
         f"{active_module}.\nProject info: {json.dumps(PROJECT_STATE.get('project'))}\n\n"
@@ -771,6 +869,15 @@ def get_state():
 @app.post("/api/chat")
 def chat_copilot(payload: ChatPayload):
     logger.info(f"User: {payload.message} (module: {payload.active_module})")
+
+    # Layer 0/1 guardrail — short-circuit before any Mistral call (token protection)
+    if not is_on_topic(payload.message):
+        logger.info("Guardrail blocked off-topic query.")
+        PROJECT_STATE["chatHistory"].append({"role": "user", "text": payload.message})
+        PROJECT_STATE["chatHistory"].append({"role": "bot", "text": REFUSAL})
+        return {"status": "blocked", "response": REFUSAL, "project_state": PROJECT_STATE}
+
+
 
     messages = []
     for msg in PROJECT_STATE["chatHistory"][-10:]:

@@ -23,15 +23,23 @@ export const api = {
     return handle(await fetch(`${API_URL}/api/get-state`));
   },
   async initProject(info: ProjectInfo, doc?: File | null) {
-    // If a construction doc is attached, send multipart so the backend can OCR/parse it.
+    // Upload the construction document through the same endpoint the Copilot
+    // uses (this one is known-working end-to-end: it parses PDF/DOCX/TXT and
+    // indexes into RAG). Then call init-project as JSON with a flag so the
+    // backend baseline can retrieve doc chunks from RAG.
     if (doc) {
-      const fd = new FormData();
-      fd.append("info", JSON.stringify(info));
-      fd.append("document", doc);
+      try {
+        await api.upload(doc, info);
+      } catch (e) {
+        // Surface the upload failure but still try to init so the wizard
+        // doesn't block the user entirely.
+        console.error("Wizard doc upload failed:", e);
+      }
       return handle(
         await fetch(`${API_URL}/api/init-project`, {
           method: "POST",
-          body: fd,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...info, hasDocument: true, documentName: doc.name }),
         }),
       );
     }

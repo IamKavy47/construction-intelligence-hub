@@ -47,7 +47,7 @@ export function Sidebar({ active, onSelect }: Props) {
             JD
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">Kavy Porwal</p>
+            <p className="text-sm font-medium truncate">John Doe</p>
             <p className="text-xs text-[color:var(--muted)] truncate">
               Principal Architect
             </p>
