@@ -1,67 +1,78 @@
 import { useState } from "react";
-import { X, Check, Loader2, Upload, FileText } from "lucide-react";
+import { X, Check, Loader2, Upload, FileText, PencilLine, FileUp } from "lucide-react";
 import type { ProjectInfo } from "@/lib/types";
 import { useInitProject } from "@/hooks/use-project";
 
-const STEPS = [
-  {
-    id: "basic",
-    title: "Basic Information",
-    fields: [
-      { id: "projectName", label: "Project Name", type: "text", placeholder: "e.g. Apex Tower" },
-      { id: "client", label: "Client", type: "text", placeholder: "Client Name" },
-      { id: "location", label: "Location", type: "text", placeholder: "City, Country" },
-      {
-        id: "projectType",
-        label: "Project Type",
-        type: "select",
-        options: ["Residential", "Commercial", "Industrial", "Infrastructure"],
-      },
-    ],
-  },
-  {
-    id: "building",
-    title: "Building Information",
-    fields: [
-      { id: "floors", label: "Total Floors", type: "number", placeholder: "0" },
-      { id: "builtArea", label: "Built Area (sqm)", type: "number", placeholder: "0" },
-      {
-        id: "structuralSystem",
-        label: "Structural System",
-        type: "select",
-        options: ["RC Frame", "Steel Frame", "Composite", "Precast"],
-      },
-    ],
-  },
-  {
-    id: "schedule",
-    title: "Schedule Baseline",
-    fields: [
-      { id: "startDate", label: "Start Date", type: "date" },
-      { id: "completionDate", label: "Target Completion", type: "date" },
-      {
-        id: "shiftCount",
-        label: "Shift Count",
-        type: "select",
-        options: ["1 Shift", "2 Shifts", "24/7 Operations"],
-      },
-    ],
-  },
-  {
-    id: "document",
-    title: "Construction Document",
-    fields: [],
-  },
-  {
-    id: "intelligence",
-    title: "Intelligence Settings",
-    fields: [
-      { id: "aiRisk", label: "Predictive Risk Intelligence", type: "toggle", desc: "AI continuous risk forecasting" },
-      { id: "aiWeather", label: "Weather Impact Matrix", type: "toggle", desc: "Auto-adjust schedule based on weather" },
-      { id: "aiDocs", label: "Document Conflict Detection", type: "toggle", desc: "Auto-scan drawings for clashes" },
-    ],
-  },
-] as const;
+type Field = {
+  id: string;
+  label: string;
+  type: "text" | "number" | "select" | "date" | "toggle";
+  placeholder?: string;
+  options?: readonly string[];
+  desc?: string;
+};
+
+type Step = { id: string; title: string; fields: Field[] };
+
+const STEP_MODE: Step = { id: "mode", title: "Setup Method", fields: [] };
+
+const STEP_BASIC: Step = {
+  id: "basic",
+  title: "Basic Information",
+  fields: [
+    { id: "projectName", label: "Project Name", type: "text", placeholder: "e.g. Apex Tower" },
+    { id: "client", label: "Client", type: "text", placeholder: "Client Name" },
+    { id: "location", label: "Location", type: "text", placeholder: "City, Country" },
+    {
+      id: "projectType",
+      label: "Project Type",
+      type: "select",
+      options: ["Residential", "Commercial", "Industrial", "Infrastructure"],
+    },
+  ],
+};
+
+const STEP_BUILDING: Step = {
+  id: "building",
+  title: "Building Information",
+  fields: [
+    { id: "floors", label: "Total Floors", type: "number", placeholder: "0" },
+    { id: "builtArea", label: "Built Area (sqm)", type: "number", placeholder: "0" },
+    {
+      id: "structuralSystem",
+      label: "Structural System",
+      type: "select",
+      options: ["RC Frame", "Steel Frame", "Composite", "Precast"],
+    },
+  ],
+};
+
+const STEP_SCHEDULE: Step = {
+  id: "schedule",
+  title: "Schedule Baseline",
+  fields: [
+    { id: "startDate", label: "Start Date", type: "date" },
+    { id: "completionDate", label: "Target Completion", type: "date" },
+    {
+      id: "shiftCount",
+      label: "Shift Count",
+      type: "select",
+      options: ["1 Shift", "2 Shifts", "24/7 Operations"],
+    },
+  ],
+};
+
+const STEP_DOCUMENT: Step = { id: "document", title: "Construction Document", fields: [] };
+
+const STEP_INTELLIGENCE: Step = {
+  id: "intelligence",
+  title: "Intelligence Settings",
+  fields: [
+    { id: "aiRisk", label: "Predictive Risk Intelligence", type: "toggle", desc: "AI continuous risk forecasting" },
+    { id: "aiWeather", label: "Weather Impact Matrix", type: "toggle", desc: "Auto-adjust schedule based on weather" },
+    { id: "aiDocs", label: "Document Conflict Detection", type: "toggle", desc: "Auto-scan drawings for clashes" },
+  ],
+};
 
 const DEFAULTS: ProjectInfo = {
   projectName: "",
@@ -79,27 +90,45 @@ const DEFAULTS: ProjectInfo = {
   aiDocs: true,
 };
 
+type Mode = "manual" | "document" | null;
+
 export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [step, setStep] = useState(0);
+  const [mode, setMode] = useState<Mode>(null);
   const [data, setData] = useState<ProjectInfo>(DEFAULTS);
   const [doc, setDoc] = useState<File | null>(null);
   const init = useInitProject();
 
   if (!open) return null;
 
-  const isLast = step === STEPS.length - 1;
-  const current = STEPS[step];
+  const steps: Step[] =
+    mode === "document"
+      ? [STEP_MODE, STEP_DOCUMENT, STEP_INTELLIGENCE]
+      : mode === "manual"
+      ? [STEP_MODE, STEP_BASIC, STEP_BUILDING, STEP_SCHEDULE, STEP_DOCUMENT, STEP_INTELLIGENCE]
+      : [STEP_MODE];
 
-  const setField = (id: string, value: unknown) =>
-    setData((d) => ({ ...d, [id]: value }));
+  const safeStep = Math.min(step, steps.length - 1);
+  const current = steps[safeStep];
+  const isLast = safeStep === steps.length - 1;
+
+  const nextDisabled =
+    (current.id === "mode" && !mode) || (current.id === "document" && mode === "document" && !doc);
+
+  const setField = (id: string, value: unknown) => setData((d) => ({ ...d, [id]: value }));
+
+  const reset = () => {
+    setStep(0);
+    setMode(null);
+    setData(DEFAULTS);
+    setDoc(null);
+  };
 
   const submit = async () => {
     try {
       await init.mutateAsync({ info: data, doc });
       onClose();
-      setStep(0);
-      setData(DEFAULTS);
-      setDoc(null);
+      reset();
     } catch {
       /* toast handled in hook */
     }
@@ -112,7 +141,7 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
           <div>
             <h2 className="text-lg font-semibold">Project Intelligence Setup</h2>
             <p className="text-sm text-[color:var(--muted)]">
-              Configure AI parameters and project baselines.
+              Enter project details, or let the AI read your construction document.
             </p>
           </div>
           <button
@@ -125,26 +154,26 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
 
         <div className="flex flex-1 overflow-hidden">
           <div className="w-1/3 border-r border-border bg-surface/50 p-6 space-y-2 overflow-y-auto">
-            {STEPS.map((s, i) => (
+            {steps.map((s, i) => (
               <button
                 key={s.id}
                 onClick={() => setStep(i)}
                 className={`w-full text-left flex items-center gap-3 p-3 rounded-lg text-sm transition ${
-                  i === step
+                  i === safeStep
                     ? "bg-background border border-border font-medium"
                     : "text-[color:var(--muted)] hover:bg-background"
                 }`}
               >
                 <div
                   className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${
-                    i < step
+                    i < safeStep
                       ? "bg-[color:var(--success)] text-white"
-                      : i === step
+                      : i === safeStep
                       ? "bg-primary text-white"
                       : "bg-border text-[color:var(--muted)]"
                   }`}
                 >
-                  {i < step ? <Check className="w-3 h-3" /> : i + 1}
+                  {i < safeStep ? <Check className="w-3 h-3" /> : i + 1}
                 </div>
                 {s.title}
               </button>
@@ -154,18 +183,62 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
           <div className="w-2/3 p-8 overflow-y-auto bg-background">
             <h3 className="text-base font-semibold mb-4">{current.title}</h3>
 
-            {current.id === "document" ? (
+            {current.id === "mode" && (
+              <div className="space-y-3">
+                <p className="text-sm text-[color:var(--muted)]">
+                  How would you like to set this project up? Both paths produce the same
+                  AI-generated baseline — materials, risks, safety and metrics.
+                </p>
+                {[
+                  {
+                    id: "manual" as const,
+                    icon: PencilLine,
+                    title: "Enter project details",
+                    desc: "Fill in name, client, floors, area, structural system and schedule. You can still attach a document later in the flow.",
+                  },
+                  {
+                    id: "document" as const,
+                    icon: FileUp,
+                    title: "Upload construction document",
+                    desc: "Upload a PDF, DOCX, MD or TXT with rooms, floors, area, gates, windows, finishes or BOQ. The AI extracts the project details from it and seeds every module.",
+                  },
+                ].map((o) => (
+                  <button
+                    key={o.id}
+                    onClick={() => {
+                      setMode(o.id);
+                      setStep(1);
+                    }}
+                    className={`w-full text-left flex gap-4 p-4 rounded-xl border transition ${
+                      mode === o.id
+                        ? "border-primary bg-surface"
+                        : "border-border hover:border-primary hover:bg-surface/50"
+                    }`}
+                  >
+                    <o.icon className="w-5 h-5 text-primary flex-shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-sm font-medium">{o.title}</div>
+                      <div className="text-xs text-[color:var(--muted)] mt-1 leading-relaxed">
+                        {o.desc}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {current.id === "document" && (
               <div className="space-y-4">
                 <p className="text-sm text-[color:var(--muted)]">
-                  Upload your construction document (drawings, room schedule, BOQ, spec book).
-                  The AI will parse rooms, floors, gates, windows, and finishes to seed material
-                  estimation, risks and safety hazards. Optional — but strongly recommended.
+                  {mode === "document"
+                    ? "Upload your construction document. The AI reads it, extracts the project name, client, location, floors, area and structural system, and grounds material estimation, risks and safety in its actual contents."
+                    : "Optionally attach a construction document (drawings, room schedule, BOQ, spec book). The AI will use it to ground material estimation, risks and safety."}
                 </p>
 
                 <label className="block cursor-pointer">
                   <input
                     type="file"
-                    accept=".pdf,.docx,.txt,.md"
+                    accept=".pdf,.docx,.doc,.txt,.md,.csv"
                     className="hidden"
                     onChange={(e) => setDoc(e.target.files?.[0] ?? null)}
                   />
@@ -183,14 +256,31 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
                     ) : (
                       <>
                         <Upload className="w-8 h-8 text-[color:var(--muted)] mx-auto mb-2" />
-                        <div className="text-sm font-medium">Click to upload PDF / DOCX / TXT</div>
+                        <div className="text-sm font-medium">
+                          Click to upload PDF / DOCX / MD / TXT
+                        </div>
                         <div className="text-xs text-[color:var(--muted)] mt-1">
-                          Max ~20MB. First 50 pages will be parsed by AI.
+                          Text is extracted and indexed for AI retrieval before the baseline runs.
                         </div>
                       </>
                     )}
                   </div>
                 </label>
+
+                {mode === "document" && (
+                  <div>
+                    <label className="text-xs font-medium text-[color:var(--muted)] mb-1 block">
+                      Project Name (optional — AI fills this from the document)
+                    </label>
+                    <input
+                      type="text"
+                      value={data.projectName}
+                      placeholder="Leave blank to let the AI extract it"
+                      onChange={(e) => setField("projectName", e.target.value)}
+                      className="w-full bg-surface border border-border rounded-lg p-2 text-sm focus:outline-none focus:border-primary"
+                    />
+                  </div>
+                )}
 
                 {doc && (
                   <button
@@ -201,7 +291,9 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
                   </button>
                 )}
               </div>
-            ) : (
+            )}
+
+            {current.fields.length > 0 && (
               <div className="space-y-4">
                 {current.fields.map((f) => {
                   const key = f.id as keyof ProjectInfo;
@@ -215,9 +307,7 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
                       >
                         <div>
                           <p className="text-sm font-medium">{f.label}</p>
-                          <p className="text-xs text-[color:var(--muted)] mt-1">
-                            {"desc" in f ? f.desc : ""}
-                          </p>
+                          <p className="text-xs text-[color:var(--muted)] mt-1">{f.desc ?? ""}</p>
                         </div>
                         <button
                           onClick={() => setField(f.id, !checked)}
@@ -245,7 +335,7 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
                           onChange={(e) => setField(f.id, e.target.value)}
                           className="w-full bg-surface border border-border rounded-lg p-2 text-sm focus:outline-none focus:border-primary"
                         >
-                          {(f.options as readonly string[]).map((o) => (
+                          {(f.options ?? []).map((o) => (
                             <option key={o}>{o}</option>
                           ))}
                         </select>
@@ -260,13 +350,11 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
                       <input
                         type={f.type}
                         value={String(value ?? "")}
-                        placeholder={"placeholder" in f ? f.placeholder : ""}
+                        placeholder={f.placeholder ?? ""}
                         onChange={(e) =>
                           setField(
                             f.id,
-                            f.type === "number"
-                              ? Number(e.target.value) || 0
-                              : e.target.value,
+                            f.type === "number" ? Number(e.target.value) || 0 : e.target.value,
                           )
                         }
                         className="w-full bg-surface border border-border rounded-lg p-2 text-sm focus:outline-none focus:border-primary"
@@ -282,20 +370,20 @@ export function Wizard({ open, onClose }: { open: boolean; onClose: () => void }
         <div className="px-6 py-4 border-t border-border flex justify-between items-center bg-surface">
           <button
             onClick={() => setStep((s) => Math.max(0, s - 1))}
-            disabled={step === 0 || init.isPending}
+            disabled={safeStep === 0 || init.isPending}
             className="px-4 py-2 text-sm font-medium text-[color:var(--muted)] disabled:opacity-30 hover:text-[color:var(--text-main)]"
           >
             Back
           </button>
           <button
-            disabled={init.isPending}
+            disabled={init.isPending || nextDisabled}
             onClick={() => (isLast ? submit() : setStep((s) => s + 1))}
-            className="px-6 py-2 text-sm font-medium bg-[color:var(--text-main)] text-surface rounded-lg hover:bg-black transition-colors flex items-center gap-2 disabled:opacity-60"
+            className="px-6 py-2 text-sm font-medium bg-[color:var(--text-main)] text-surface rounded-lg hover:bg-black transition-colors flex items-center gap-2 disabled:opacity-40"
           >
             {init.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
             {isLast
               ? init.isPending
-                ? "Initializing with AI..."
+                ? "Reading document & initializing..."
                 : "Initialize Project"
               : "Next Step"}
           </button>

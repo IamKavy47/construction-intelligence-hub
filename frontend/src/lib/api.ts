@@ -23,18 +23,11 @@ export const api = {
     return handle(await fetch(`${API_URL}/api/get-state`));
   },
   async initProject(info: ProjectInfo, doc?: File | null) {
-    // Upload the construction document through the same endpoint the Copilot
-    // uses (this one is known-working end-to-end: it parses PDF/DOCX/TXT and
-    // indexes into RAG). Then call init-project as JSON with a flag so the
-    // backend baseline can retrieve doc chunks from RAG.
+    // Upload the construction document through the working /api/upload endpoint
+    // first (silent = index only, reset = clear the previous project's index),
+    // then call init-project so the AI baseline is grounded in that document.
     if (doc) {
-      try {
-        await api.upload(doc, info);
-      } catch (e) {
-        // Surface the upload failure but still try to init so the wizard
-        // doesn't block the user entirely.
-        console.error("Wizard doc upload failed:", e);
-      }
+      await api.upload(doc, info, { silent: true, reset: true });
       return handle(
         await fetch(`${API_URL}/api/init-project`, {
           method: "POST",
@@ -47,7 +40,7 @@ export const api = {
       await fetch(`${API_URL}/api/init-project`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(info),
+        body: JSON.stringify({ ...info, hasDocument: false }),
       }),
     );
   },
@@ -60,12 +53,18 @@ export const api = {
       }),
     );
   },
-  async upload(file: File, project: ProjectInfo | null) {
+  async upload(
+    file: File,
+    project: ProjectInfo | null,
+    opts?: { silent?: boolean; reset?: boolean },
+  ) {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("projectName", project?.projectName ?? "");
     fd.append("client", project?.client ?? "");
     fd.append("location", project?.location ?? "");
+    fd.append("silent", opts?.silent ? "true" : "false");
+    fd.append("reset", opts?.reset ? "true" : "false");
     return handle(
       await fetch(`${API_URL}/api/upload`, { method: "POST", body: fd }),
     );
