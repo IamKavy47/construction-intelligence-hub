@@ -1,4 +1,7 @@
 import { useState } from "react";
+import { useRouter } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { useQueryClient } from "@tanstack/react-query";
 import { Sidebar } from "@/components/Sidebar";
 import { AIBar } from "@/components/AIBar";
 import { WelcomeScreen } from "@/components/WelcomeScreen";
@@ -11,15 +14,27 @@ import { Safety } from "@/components/modules/Safety";
 import { DailyReport } from "@/components/modules/DailyReport";
 import { Copilot } from "@/components/modules/Copilot";
 import { useProjectState, useChat, useSimulate } from "@/hooks/use-project";
+import { logout } from "@/lib/auth.functions";
 import type { ModuleId } from "@/lib/types";
-import { ChevronDown, Zap, Bell, AlertTriangle, Loader2 } from "lucide-react";
+import { ChevronDown, Zap, Bell, AlertTriangle, Loader2, LogOut } from "lucide-react";
 
-export function AppShell() {
+export function AppShell({ username }: { username?: string | null }) {
   const [active, setActive] = useState<ModuleId>("dashboard");
   const [wizard, setWizard] = useState(false);
   const { data: state, error, isLoading } = useProjectState();
   const chat = useChat();
   const simulate = useSimulate();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const doLogout = useServerFn(logout);
+
+  const signOut = async () => {
+    await queryClient.cancelQueries();
+    queryClient.clear();
+    await doLogout({});
+    await router.navigate({ to: "/auth", replace: true });
+  };
+
 
   const navigate = (m: ModuleId) => setActive(m);
 
@@ -98,7 +113,20 @@ export function AppShell() {
                 <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-[color:var(--danger)] rounded-full border border-background" />
               )}
             </button>
+
+            <div className="flex items-center gap-2 pl-3 border-l border-border">
+              {username && (
+                <span className="text-xs font-medium text-[color:var(--muted)]">{username}</span>
+              )}
+              <button
+                onClick={signOut}
+                className="text-xs font-medium px-2.5 py-1.5 rounded-md border border-border hover:border-primary transition flex items-center gap-1"
+              >
+                <LogOut className="w-3 h-3" /> Sign out
+              </button>
+            </div>
           </div>
+
         </header>
 
         <div className="flex-1 overflow-y-auto p-6 pb-40">
