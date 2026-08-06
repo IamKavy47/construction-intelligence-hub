@@ -19,18 +19,54 @@ export function useInitProject() {
       api.initProject(info, doc ?? null),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["project-state"] });
+      qc.invalidateQueries({ queryKey: ["db-projects"] });
       toast.success("Project initialized with AI baseline");
     },
     onError: (e: Error) => toast.error(e.message),
   });
 }
 
-export function useChat() {
+/** Streaming chat. `onToken` receives text as the model types it. */
+export function useChat(on?: {
+  onToken?: (text: string) => void;
+  onReset?: () => void;
+  onTools?: (names: string[]) => void;
+}) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ message, module }: { message: string; module: string }) =>
-      api.chat(message, module),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["project-state"] }),
+      api.chatStream(message, module, {
+        onToken: on?.onToken,
+        onReset: on?.onReset,
+        onTools: on?.onTools,
+      }),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["project-state"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+/** All projects saved in MongoDB, for the header project switcher. */
+export function useProjects() {
+  return useQuery({
+    queryKey: ["db-projects"],
+    queryFn: () => api.listProjects().then((r) => r.projects),
+    retry: 0,
+    staleTime: 30_000,
+  });
+}
+
+export function useLoadProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.loadProject(id),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["project-state"] });
+      toast.success("Project loaded");
+    },
     onError: (e: Error) => toast.error(e.message),
   });
 }

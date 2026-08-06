@@ -13,16 +13,22 @@ import { Risk } from "@/components/modules/Risk";
 import { Safety } from "@/components/modules/Safety";
 import { DailyReport } from "@/components/modules/DailyReport";
 import { Copilot } from "@/components/modules/Copilot";
+import { ProjectSwitcher } from "@/components/ProjectSwitcher";
 import { useProjectState, useChat, useSimulate } from "@/hooks/use-project";
 import { logout } from "@/lib/auth.functions";
 import type { ModuleId } from "@/lib/types";
-import { ChevronDown, Zap, Bell, AlertTriangle, Loader2, LogOut } from "lucide-react";
+import { Zap, Bell, AlertTriangle, Loader2, LogOut } from "lucide-react";
 
 export function AppShell({ username }: { username?: string | null }) {
   const [active, setActive] = useState<ModuleId>("dashboard");
   const [wizard, setWizard] = useState(false);
+  const [streamText, setStreamText] = useState("");
+  const [pendingUser, setPendingUser] = useState("");
   const { data: state, error, isLoading } = useProjectState();
-  const chat = useChat();
+  const chat = useChat({
+    onToken: (t) => setStreamText((prev) => prev + t),
+    onReset: () => setStreamText(""),
+  });
   const simulate = useSimulate();
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -40,10 +46,15 @@ export function AppShell({ username }: { username?: string | null }) {
 
   const sendChat = async (text: string) => {
     if (active !== "copilot") setActive("copilot");
+    setPendingUser(text);
+    setStreamText("");
     try {
       await chat.mutateAsync({ message: text, module: active });
     } catch {
       /* toast */
+    } finally {
+      setPendingUser("");
+      setStreamText("");
     }
   };
 
@@ -87,14 +98,10 @@ export function AppShell({ username }: { username?: string | null }) {
 
         <header className="h-16 border-b border-border bg-background/80 backdrop-blur-md flex items-center justify-between px-6 flex-shrink-0 z-10">
           <div className="flex items-center gap-4">
-            <button
-              onClick={() => setWizard(true)}
-              className="flex items-center gap-2 bg-surface px-3 py-1.5 rounded-md border border-border hover:border-primary transition"
-            >
-              <div className="w-2 h-2 rounded-full bg-[color:var(--success)]" />
-              <span className="text-sm font-medium">{state.project.projectName}</span>
-              <ChevronDown className="w-4 h-4 text-[color:var(--muted)]" />
-            </button>
+            <ProjectSwitcher
+              activeName={state.project.projectName}
+              onNewProject={() => setWizard(true)}
+            />
           </div>
 
           <div className="flex items-center gap-3">
@@ -136,7 +143,14 @@ export function AppShell({ username }: { username?: string | null }) {
           {active === "risk" && <Risk state={state} onAskCopilot={sendChat} />}
           {active === "safety" && <Safety state={state} onLog={logIncident} onAskCopilot={sendChat} />}
           {active === "report" && <DailyReport state={state} />}
-          {active === "copilot" && <Copilot state={state} pending={chat.isPending} />}
+          {active === "copilot" && (
+            <Copilot
+              state={state}
+              pending={chat.isPending}
+              streaming={streamText}
+              pendingUser={pendingUser}
+            />
+          )}
         </div>
 
         <AIBar

@@ -44,10 +44,10 @@ export function Sidebar({ active, onSelect }: Props) {
       <div className="p-4 border-t border-border">
         <div className="flex items-center gap-3 bg-surface p-3 rounded-xl border border-border">
           <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white font-medium text-sm">
-            KP
+            JD
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">Kavy Porwal</p>
+            <p className="text-sm font-medium truncate">John Doe</p>
             <p className="text-xs text-[color:var(--muted)] truncate">
               Principal Architect
             </p>
