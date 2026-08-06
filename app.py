@@ -49,6 +49,7 @@ def empty_state() -> Dict[str, Any]:
         "workforce": [],
         "safety": [],
         "safetyHazards": [],
+        "ppeChecks": [],
         "timeline": [],
         "dailyReports": [],
         "weatherReport": None,
@@ -63,6 +64,7 @@ def empty_state() -> Dict[str, Any]:
         "insuranceClaims": [
             {"id": "CLM-001", "policyNumber": "POL-CIVIL-998A", "claimType": "Property/Storm Damage", "exposureValuation": 45000.0, "status": "Under Review", "filedDate": date.today().isoformat()}
         ],
+        "riskEngine": None,  # Latest Construction Risk Intelligence Engine output
         "workflows": []      # Mitigation task assignments, owners, and due dates
     
     }
@@ -723,8 +725,8 @@ def _get_llm():
 
 def _agent_system_prompt(active_module: str) -> SystemMessage:
     return SystemMessage(content=with_guardrails(
-        "You are the core AI engine of the Construction Intelligence Hub. The user is JD "
-        "(John Doe, Principal Architect). The active module tab is: "
+        "You are the core AI engine of the Construction Intelligence Hub. The user is Kavy "
+        "(Kavy Porwal, Principal Architect). The active module tab is: "
         f"{active_module}.\nThe project info is: {json.dumps(PROJECT_STATE.get('project'))}\n\n"
         "There is no separate Weather module in this app -- weather intelligence is part of "
         "the Risk and Safety modules. When weather is relevant, call weather_lookup and "
@@ -1586,6 +1588,155 @@ def generate_daily_report():
 
 
 # =====================================================================================
+# PPE / WORKER SAFETY IMAGE ANALYSIS — Google Gemini vision
+# A worker photo (site check-in) is sent to Gemini, which checks the mandatory PPE
+# items and returns a structured verdict. Violations are logged into the safety log,
+# raise a dashboard alert, and refresh the safety KPIs.
+# =====================================================================================
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash")
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+PPE_ITEMS = ["helmet", "high_visibility_vest", "safety_harness", "gloves", "safety_boots", "eye_protection"]
+
+PPE_PROMPT = (
+    "You are a construction site safety officer performing a PPE (personal protective "
+    "equipment) check on this worker check-in photo.\n"
+    "Inspect the image and decide, for each item, whether it is clearly worn: "
+    + ", ".join(PPE_ITEMS) + ".\n"
+    "Reply with ONLY a JSON object in this exact shape:\n"
+    '{"worker_detected": true, "compliant": false, "confidence": 0.0-1.0, '
+    '"items": {"helmet": "present|missing|unclear", "high_visibility_vest": "...", '
+    '"safety_harness": "...", "gloves": "...", "safety_boots": "...", '
+    '"eye_protection": "..."}, "violations": ["no helmet"], '
+    '"severity": "Low|Medium|High", "summary": "one short sentence", '
+    '"recommendation": "one short corrective action"}\n'
+    "Mark safety_harness as 'unclear' when the task does not involve work at height. "
+    "Set compliant=false if helmet, vest or boots are missing. Never invent PPE you cannot see."
+)
+
+
+def _gemini_ppe_verdict(image_bytes: bytes, mime_type: str, filename: str) -> Dict[str, Any]:
+    """Uploads the photo to Gemini and returns the parsed PPE verdict."""
+    api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured on the server.")
+    try:
+        from google import genai
+    except ImportError:
+        raise HTTPException(status_code=503, detail="google-genai is not installed. Run: pip install google-genai")
+
+    import tempfile
+
+    suffix = os.path.splitext(filename or "")[1] or ".jpg"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+
+        client = genai.Client(api_key=api_key)
+        uploaded_file = client.files.upload(file=tmp_path)
+        interaction = client.interactions.create(
+            model=GEMINI_VISION_MODEL,
+            input=[
+                {"type": "text", "text": PPE_PROMPT},
+                {
+                    "type": "image",
+                    "uri": uploaded_file.uri,
+                    "mime_type": uploaded_file.mime_type or mime_type,
+                },
+            ],
+        )
+        text = getattr(interaction, "output_text", "") or ""
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gemini PPE analysis failed: {e}")
+        raise HTTPException(status_code=502, detail=f"PPE image analysis failed: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    verdict = _extract_json(text)
+    if not verdict:
+        raise HTTPException(status_code=502, detail="The vision model did not return a readable PPE verdict.")
+    return verdict
+
+
+@app.post("/api/analyze-ppe")
+async def analyze_ppe(
+    file: UploadFile = File(...),
+    workerName: str = Form(""),
+    location: str = Form(""),
+):
+    """Worker check-in PPE compliance check powered by Gemini vision."""
+    _require_project()
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image (JPG or PNG).")
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The uploaded image is empty.")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image is too large (max 12 MB).")
+
+    verdict = _gemini_ppe_verdict(image_bytes, file.content_type or "image/jpeg", file.filename or "photo.jpg")
+
+    worker = (workerName or "").strip() or "Unidentified worker"
+    site = (location or "").strip() or ((PROJECT_STATE.get("project") or {}).get("location") or "Site Wide")
+    violations = [str(v) for v in (verdict.get("violations") or [])]
+    compliant = bool(verdict.get("compliant")) and not violations
+    severity = str(verdict.get("severity") or ("Low" if compliant else "High"))
+    if severity not in ("Low", "Medium", "High"):
+        severity = "High" if not compliant else "Low"
+
+    checks = PROJECT_STATE.setdefault("ppeChecks", [])
+    check_id = f"PPE-{len(checks) + 1:03d}"
+    record = {
+        "id": check_id,
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "worker": worker,
+        "location": site,
+        "compliant": compliant,
+        "severity": severity,
+        "items": verdict.get("items") or {},
+        "violations": violations,
+        "confidence": verdict.get("confidence"),
+        "workerDetected": verdict.get("worker_detected", True),
+        "summary": str(verdict.get("summary") or ""),
+        "recommendation": str(verdict.get("recommendation") or ""),
+        "imageName": file.filename,
+    }
+    checks.insert(0, record)
+    PROJECT_STATE["ppeChecks"] = checks[:60]
+
+    PROJECT_STATE["safety"].insert(0, {
+        "id": f"SAF-{check_id}",
+        "date": date.today().isoformat(),
+        "type": "PPE Check" if compliant else "PPE Violation",
+        "desc": record["summary"] or (
+            f"{worker} passed the PPE check." if compliant
+            else f"{worker}: {', '.join(violations)}"
+        ),
+        "location": site,
+        "severity": "Info" if compliant else severity,
+    })
+    if not compliant:
+        PROJECT_STATE["alerts"].insert(0, {
+            "type": "danger" if severity == "High" else "warning",
+            "text": f"PPE violation — {worker} at {site}: {', '.join(violations) or 'missing PPE'}",
+        })
+        PROJECT_STATE["alerts"] = PROJECT_STATE["alerts"][:20]
+
+    PROJECT_STATE["safetyKpis"] = compute_safety_kpis()
+    db_log_activity("analyze-ppe", f"{worker} — {'compliant' if compliant else ', '.join(violations)}")
+
+    return {"status": "success", "check": record, "project_state": PROJECT_STATE}
+
+
+
+# =====================================================================================
 # VOICE — Sarvam AI  (multilingual STT + TTS for Indian languages)
 # STT: saaras:v4 with language_code="unknown" => auto language detection (mode=translate
 #      also normalises regional speech into clean text the agent can reason over).
@@ -1865,6 +2016,492 @@ def db_activity(project_id: Optional[str] = None, limit: int = 200):
     for d in docs:
         d["createdAt"] = d["createdAt"].isoformat()
     return {"activity": docs}
+
+
+# =====================================================================================
+# CONSTRUCTION RISK INTELLIGENCE ENGINE
+# Consolidates every signal already in the project state (risk register, safety logs,
+# PPE checks, weather, schedule, materials) into one weighted score, detects recurring
+# patterns from MongoDB history, and asks the AI for prioritized recommendations.
+# =====================================================================================
+_SEV = {"low": 1, "medium": 2, "high": 3, "critical": 3, "info": 0}
+
+
+def _sev(v: Any) -> int:
+    return _SEV.get(str(v or "").strip().lower(), 1)
+
+
+def _risk_signals() -> Dict[str, Any]:
+    risks = PROJECT_STATE.get("risks") or []
+    safety = PROJECT_STATE.get("safety") or []
+    ppe = PROJECT_STATE.get("ppeChecks") or []
+    timeline = PROJECT_STATE.get("timeline") or []
+    materials = PROJECT_STATE.get("materials") or []
+    weather = PROJECT_STATE.get("weatherReport") or {}
+
+    open_risks = [r for r in risks if str(r.get("status", "")).lower() not in ("closed", "resolved", "mitigated")]
+    risk_load = sum(_sev(r.get("prob")) * _sev(r.get("impact")) for r in open_risks)
+    risk_component = min(100.0, (risk_load / max(1, len(open_risks) * 9)) * 100) if open_risks else 0.0
+
+    high_incidents = [s for s in safety if _sev(s.get("severity")) >= 3]
+    safety_component = min(100.0, len(high_incidents) * 25 + max(0, len(safety) - len(high_incidents)) * 6)
+
+    violations = [p for p in ppe if not p.get("compliant")]
+    ppe_component = min(100.0, (len(violations) / len(ppe)) * 100) if ppe else 0.0
+
+    at_risk_phases = [p for p in timeline if str(p.get("risk", "")).lower() in ("high", "medium")]
+    behind = [p for p in timeline if p.get("status") == "active" and (p.get("progress") or 0) < 40]
+    schedule_component = min(100.0, len(at_risk_phases) * 15 + len(behind) * 20) if timeline else 0.0
+
+    shortages = [m for m in materials if str(m.get("status", "")).lower() in ("critical", "shortage", "low", "reorder")]
+    material_component = min(100.0, (len(shortages) / len(materials)) * 100) if materials else 0.0
+
+    wx_risks = [f for f in (weather.get("forecast") or []) if str(f.get("risk", "")).lower() in ("high", "medium")]
+    weather_component = min(100.0, len(wx_risks) * 20)
+
+    weights = {
+        "riskRegister": (risk_component, 0.30),
+        "safety": (safety_component, 0.22),
+        "ppeCompliance": (ppe_component, 0.13),
+        "schedule": (schedule_component, 0.18),
+        "materials": (material_component, 0.09),
+        "weather": (weather_component, 0.08),
+    }
+    score = round(sum(v * w for v, w in weights.values()), 1)
+    grade = "Critical" if score >= 70 else "High" if score >= 50 else "Moderate" if score >= 30 else "Low"
+    return {
+        "score": score,
+        "grade": grade,
+        "components": [
+            {"name": k, "value": round(v, 1), "weight": w, "contribution": round(v * w, 1)}
+            for k, (v, w) in weights.items()
+        ],
+        "counts": {
+            "openRisks": len(open_risks),
+            "highSeverityIncidents": len(high_incidents),
+            "ppeViolations": len(violations),
+            "atRiskPhases": len(at_risk_phases),
+            "materialShortages": len(shortages),
+            "adverseWeatherDays": len(wx_risks),
+        },
+    }
+
+
+def _recurring_patterns(limit_projects: int = 40) -> List[Dict[str, Any]]:
+    """Mines MongoDB history for risk/safety themes that keep coming back."""
+    buckets: Dict[str, Dict[str, Any]] = {}
+
+    def bump(kind: str, label: str, project_id: Optional[str]):
+        key = f"{kind}::{label.strip().lower()[:60]}"
+        b = buckets.setdefault(key, {"kind": kind, "label": label.strip()[:120], "count": 0, "projects": set()})
+        b["count"] += 1
+        if project_id:
+            b["projects"].add(project_id)
+
+    # current project always counts
+    for r in PROJECT_STATE.get("risks") or []:
+        bump("risk", r.get("category") or r.get("desc") or "Unclassified risk", CURRENT_PROJECT_ID)
+    for s in PROJECT_STATE.get("safety") or []:
+        bump("safety", s.get("type") or s.get("desc") or "Safety event", CURRENT_PROJECT_ID)
+    for p in PROJECT_STATE.get("ppeChecks") or []:
+        for v in p.get("violations") or []:
+            bump("ppe", v, CURRENT_PROJECT_ID)
+
+    db = get_db()
+    if db is not None:
+        try:
+            for doc in db.projects.find({}, {"state.risks": 1, "state.safety": 1, "state.ppeChecks": 1}).limit(limit_projects):
+                if doc["_id"] == CURRENT_PROJECT_ID:
+                    continue
+                st = doc.get("state") or {}
+                for r in st.get("risks") or []:
+                    bump("risk", r.get("category") or r.get("desc") or "Unclassified risk", doc["_id"])
+                for s in st.get("safety") or []:
+                    bump("safety", s.get("type") or s.get("desc") or "Safety event", doc["_id"])
+                for p in st.get("ppeChecks") or []:
+                    for v in p.get("violations") or []:
+                        bump("ppe", v, doc["_id"])
+        except Exception as e:
+            logger.warning(f"Pattern mining failed: {e}")
+
+    out = [{
+        "kind": b["kind"], "label": b["label"], "occurrences": b["count"],
+        "projectsAffected": len(b["projects"]),
+        "recurring": b["count"] >= 2,
+    } for b in buckets.values()]
+    out.sort(key=lambda x: (-x["occurrences"], x["label"]))
+    return out[:12]
+
+
+@app.post("/api/risk-engine")
+def run_risk_engine():
+    """Weighted site risk score + recurring-pattern detection + AI recommendations."""
+    project = _require_project()
+    signals = _risk_signals()
+    patterns = _recurring_patterns()
+
+    prompt = (
+        "You are the Construction Risk Intelligence Engine. Using the computed signals below, "
+        "produce forward-looking intelligence for this project.\n\n"
+        f"PROJECT: {json.dumps(project, indent=2)}\n"
+        f"WEIGHTED SIGNALS: {json.dumps(signals, indent=2)}\n"
+        f"RECURRING PATTERNS (mined from history): {json.dumps(patterns, indent=2)}\n\n"
+        "Call get_project_data(category='all') to confirm the live data before concluding. "
+        "Then reply with ONLY a JSON object, no prose and no code fence:\n"
+        '{"outlook":"one paragraph on where this project is heading",'
+        '"predictedIncidents":[{"type":"","likelihood":"Low|Medium|High","window":"next 7 days|next 30 days","rationale":""}],'
+        '"topDrivers":["..."],'
+        '"recommendations":[{"action":"","owner":"","priority":"Low|Medium|High","impact":""}]}'
+    )
+    ai_response = _run_module_agent(prompt, "risk", "Risk intelligence engine")
+    parsed = _extract_json(ai_response) or {}
+
+    engine = {
+        "generatedAt": _now().isoformat(),
+        "score": signals["score"],
+        "grade": signals["grade"],
+        "components": signals["components"],
+        "counts": signals["counts"],
+        "patterns": patterns,
+        "outlook": parsed.get("outlook") or ai_response[:800],
+        "predictedIncidents": parsed.get("predictedIncidents") or [],
+        "topDrivers": parsed.get("topDrivers") or [],
+        "recommendations": parsed.get("recommendations") or [],
+    }
+    PROJECT_STATE["riskEngine"] = engine
+
+    # Escalate automatically when the score crosses the alerting threshold.
+    if signals["score"] >= 50:
+        _notify(
+            level="critical" if signals["score"] >= 70 else "warning",
+            title=f"Site risk score {signals['score']} ({signals['grade']})",
+            body=engine["outlook"][:400],
+            channel_hint="risk-engine",
+        )
+    db_log_activity("risk-engine", f"score={signals['score']} grade={signals['grade']}")
+    return {"status": "success", "engine": engine, "project_state": PROJECT_STATE}
+
+
+# =====================================================================================
+# NOTIFICATION + MITIGATION WORKFLOW MODULE
+# Escalation rules run server-side. Slack/Teams delivery activates automatically when
+# SLACK_WEBHOOK_URL / TEAMS_WEBHOOK_URL are present; otherwise every notification is
+# still recorded in the in-app notification log and MongoDB (audit trail).
+# =====================================================================================
+def _post_webhook(url: str, text: str) -> bool:
+    try:
+        r = requests.post(url, json={"text": text}, timeout=10)
+        return r.status_code < 300
+    except Exception as e:
+        logger.warning(f"Webhook delivery failed: {e}")
+        return False
+
+
+def _notify(level: str, title: str, body: str, channel_hint: str = "system") -> Dict[str, Any]:
+    delivered: List[str] = []
+    text = f"[{level.upper()}] {title}\n{body}"
+    for env_key, channel in (("SLACK_WEBHOOK_URL", "slack"), ("TEAMS_WEBHOOK_URL", "teams")):
+        url = os.getenv(env_key)
+        if url and _post_webhook(url, text):
+            delivered.append(channel)
+    record = {
+        "id": f"NTF-{_now().strftime('%Y%m%d%H%M%S%f')[:-3]}",
+        "level": level, "title": title, "body": body,
+        "source": channel_hint,
+        "delivered": delivered or ["in-app"],
+        "createdAt": _now().isoformat(),
+    }
+    PROJECT_STATE.setdefault("notificationsLog", []).insert(0, record)
+    PROJECT_STATE["notificationsLog"] = PROJECT_STATE["notificationsLog"][:100]
+    db = get_db()
+    if db is not None:
+        try:
+            db.notifications.insert_one({**record, "projectId": CURRENT_PROJECT_ID, "ts": _now()})
+        except Exception as e:
+            logger.warning(f"Mongo: failed to log notification: {e}")
+    return record
+
+
+class NotifyPayload(BaseModel):
+    level: str = "info"
+    title: str
+    body: str = ""
+
+
+@app.post("/api/notify")
+def send_notification(payload: NotifyPayload):
+    return {"status": "success", "notification": _notify(payload.level, payload.title, payload.body, "manual"),
+            "project_state": PROJECT_STATE}
+
+
+@app.post("/api/escalate/scan")
+def escalation_scan():
+    """Applies escalation rules to the live state and fires notifications for breaches."""
+    _require_project()
+    fired: List[Dict[str, Any]] = []
+    for r in PROJECT_STATE.get("risks") or []:
+        if _sev(r.get("prob")) * _sev(r.get("impact")) >= 6 and str(r.get("status", "")).lower() not in ("closed", "mitigated"):
+            fired.append(_notify("critical", f"High risk open: {r.get('id', '')} {r.get('desc', '')[:80]}",
+                                 r.get("mitigation") or "No mitigation recorded yet.", "escalation"))
+    for s in PROJECT_STATE.get("safety") or []:
+        if _sev(s.get("severity")) >= 3:
+            fired.append(_notify("critical", f"High-severity safety event at {s.get('location', 'site')}",
+                                 s.get("desc", ""), "escalation"))
+    for p in PROJECT_STATE.get("ppeChecks") or []:
+        if not p.get("compliant") and _sev(p.get("severity")) >= 3:
+            fired.append(_notify("warning", f"PPE violation: {p.get('worker', 'worker')}",
+                                 ", ".join(p.get("violations") or []), "escalation"))
+    db_log_activity("escalation-scan", f"fired={len(fired)}")
+    return {"status": "success", "fired": fired, "project_state": PROJECT_STATE}
+
+
+class WorkflowPayload(BaseModel):
+    id: Optional[str] = None
+    task: Optional[str] = None
+    assignedTo: Optional[str] = None
+    dueDate: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    linkedTo: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/workflows")
+def list_workflows():
+    return {"workflows": PROJECT_STATE.get("workflows") or []}
+
+
+@app.post("/api/workflows")
+def upsert_workflow(payload: WorkflowPayload):
+    """Creates or advances a mitigation task (Open -> In Progress -> Resolved)."""
+    _require_project()
+    items: List[Dict[str, Any]] = PROJECT_STATE.setdefault("workflows", [])
+    existing = next((w for w in items if w.get("id") == payload.id), None) if payload.id else None
+    if existing is None:
+        item = {
+            "id": payload.id or f"WF-{len(items) + 1:03d}",
+            "task": payload.task or "Untitled mitigation task",
+            "assignedTo": payload.assignedTo or "Unassigned",
+            "dueDate": payload.dueDate or "",
+            "status": payload.status or "Open",
+            "priority": payload.priority or "Medium",
+            "linkedTo": payload.linkedTo or "",
+            "notes": payload.notes or "",
+            "createdAt": _now().isoformat(),
+            "updatedAt": _now().isoformat(),
+        }
+        items.insert(0, item)
+        if item["priority"] == "High":
+            _notify("warning", f"High-priority mitigation assigned: {item['task'][:80]}",
+                    f"Owner: {item['assignedTo']} · Due: {item['dueDate'] or 'not set'}", "workflow")
+    else:
+        for f in ("task", "assignedTo", "dueDate", "status", "priority", "linkedTo", "notes"):
+            v = getattr(payload, f)
+            if v is not None:
+                existing[f] = v
+        existing["updatedAt"] = _now().isoformat()
+        item = existing
+        if str(item.get("status")).lower() == "resolved":
+            _notify("info", f"Mitigation resolved: {item['task'][:80]}", f"Closed by {item['assignedTo']}", "workflow")
+    db_log_activity("workflow-upsert", json.dumps(item)[:400])
+    return {"status": "success", "workflow": item, "project_state": PROJECT_STATE}
+
+
+@app.delete("/api/workflows/{workflow_id}")
+def delete_workflow(workflow_id: str):
+    items: List[Dict[str, Any]] = PROJECT_STATE.setdefault("workflows", [])
+    PROJECT_STATE["workflows"] = [w for w in items if w.get("id") != workflow_id]
+    return {"status": "success", "project_state": PROJECT_STATE}
+
+
+# =====================================================================================
+# EXECUTIVE / COMPLIANCE / INSURANCE AGGREGATION
+# =====================================================================================
+@app.get("/api/executive-summary")
+def executive_summary():
+    project = _require_project()
+    signals = _risk_signals()
+    timeline = PROJECT_STATE.get("timeline") or []
+    total_len = sum((p.get("length") or 0) for p in timeline) or 1
+    done = sum(((p.get("length") or 0) * (100 if p.get("status") == "complete" else (p.get("progress") or 0))) / 100
+               for p in timeline)
+    materials = PROJECT_STATE.get("materials") or []
+    compliance = PROJECT_STATE.get("complianceChecklist") or []
+    claims = PROJECT_STATE.get("insuranceClaims") or []
+    reports = PROJECT_STATE.get("dailyReports") or []
+    return {
+        "project": project,
+        "generatedAt": _now().isoformat(),
+        "health": PROJECT_STATE.get("health"),
+        "cpi": PROJECT_STATE.get("cpi"),
+        "spi": PROJECT_STATE.get("spi"),
+        "safetyScore": PROJECT_STATE.get("safetyScore"),
+        "budgetUsed": PROJECT_STATE.get("budgetUsed"),
+        "schedule": {
+            "phases": len(timeline),
+            "progress": round((done / total_len) * 100, 1),
+            "atRiskPhases": signals["counts"]["atRiskPhases"],
+        },
+        "risk": {"score": signals["score"], "grade": signals["grade"], "components": signals["components"],
+                 "counts": signals["counts"]},
+        "safety": {"kpis": compute_safety_kpis(),
+                   "ppeChecks": len(PROJECT_STATE.get("ppeChecks") or []),
+                   "ppeViolations": signals["counts"]["ppeViolations"]},
+        "materials": {"tracked": len(materials), "shortages": signals["counts"]["materialShortages"]},
+        "compliance": {
+            "items": compliance,
+            "averageScore": round(sum((c.get("score") or 0) for c in compliance) / len(compliance), 1) if compliance else None,
+            "openItems": len([c for c in compliance if str(c.get("status", "")).lower() != "compliant"]),
+        },
+        "insurance": {"claims": claims,
+                      "totalExposure": round(sum((c.get("exposureValuation") or 0) for c in claims), 2)},
+        "workflows": {
+            "total": len(PROJECT_STATE.get("workflows") or []),
+            "open": len([w for w in (PROJECT_STATE.get("workflows") or []) if str(w.get("status")).lower() != "resolved"]),
+            "items": PROJECT_STATE.get("workflows") or [],
+        },
+        "notifications": (PROJECT_STATE.get("notificationsLog") or [])[:10],
+        "reportsFiled": len(reports),
+        "latestReport": reports[0] if reports else None,
+        "alerts": PROJECT_STATE.get("alerts") or [],
+    }
+
+
+# =====================================================================================
+# AUDIT-READY PDF EXPORT (reportlab)
+# =====================================================================================
+def _pdf_bytes(title: str, subtitle: str, blocks: List[Any]) -> bytes:
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm,
+                            leftMargin=16 * mm, rightMargin=16 * mm, title=title)
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1x", parent=ss["Title"], fontSize=18, spaceAfter=4)
+    sub = ParagraphStyle("subx", parent=ss["Normal"], fontSize=9, textColor=colors.grey, spaceAfter=12)
+    h2 = ParagraphStyle("h2x", parent=ss["Heading2"], fontSize=12, spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle("bodyx", parent=ss["Normal"], fontSize=9.5, leading=13)
+
+    flow: List[Any] = [Paragraph(title, h1), Paragraph(subtitle, sub)]
+    for block in blocks:
+        kind = block[0]
+        if kind == "h":
+            flow.append(Paragraph(str(block[1]), h2))
+        elif kind == "p":
+            flow.append(Paragraph(str(block[1]).replace("\n", "<br/>"), body))
+        elif kind == "list":
+            for item in block[1] or ["--"]:
+                flow.append(Paragraph(f"• {item}", body))
+        elif kind == "table":
+            rows = [[Paragraph(f"<b>{c}</b>", body) for c in block[1]]] + \
+                   [[Paragraph(str(c), body) for c in r] for r in (block[2] or [["--"] * len(block[1])])]
+            t = Table(rows, hAlign="LEFT", colWidths=block[3] if len(block) > 3 else None)
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1ece5")),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d8d1c7")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            flow.append(t)
+        flow.append(Spacer(1, 4))
+    doc.build(flow)
+    return buf.getvalue()
+
+
+def _pdf_response(data: bytes, filename: str):
+    from fastapi.responses import Response as FAResponse
+    return FAResponse(content=data, media_type="application/pdf",
+                      headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/export/daily-report")
+def export_daily_report(index: int = 0):
+    """Audit-ready PDF of a daily site report (index 0 = latest)."""
+    project = _require_project()
+    reports = PROJECT_STATE.get("dailyReports") or []
+    if not reports:
+        raise HTTPException(status_code=400, detail="No daily report generated yet.")
+    r = reports[min(index, len(reports) - 1)]
+    blocks = [
+        ("h", "Project"),
+        ("table", ["Field", "Value"], [
+            ["Project", project.get("projectName", "--")], ["Client", project.get("client", "--")],
+            ["Location", project.get("location", "--")], ["Report date", r.get("date", "--")],
+            ["Progress", r.get("progress", "--")],
+        ]),
+        ("h", "Executive summary"), ("p", r.get("summary", "--")),
+        ("h", "Work completed today"), ("list", r.get("workDone")),
+        ("h", "Work planned next"), ("list", r.get("workPlanned")),
+        ("h", "Issues & blockers"), ("list", r.get("issues")),
+        ("h", "Weather impact"), ("p", r.get("weatherImpact", "--")),
+        ("h", "Safety notes"), ("p", r.get("safetyNotes", "--")),
+        ("h", "AI recommendations"), ("list", r.get("aiRecommendations")),
+    ]
+    pdf = _pdf_bytes(
+        f"Daily Site Report — {project.get('projectName', 'Project')}",
+        f"{r.get('date', '')} · Generated by Construction Intelligence Hub · Project ID {CURRENT_PROJECT_ID or '--'}",
+        blocks,
+    )
+    db_log_activity("export-daily-report", r.get("date", ""))
+    return _pdf_response(pdf, f"daily-report-{r.get('date', 'latest')}.pdf")
+
+
+@app.get("/api/export/executive-summary")
+def export_executive_summary():
+    """Audit-ready executive/compliance PDF for owners, insurers and auditors."""
+    s = executive_summary()
+    project = s["project"]
+    blocks = [
+        ("h", "Project overview"),
+        ("table", ["Field", "Value"], [
+            ["Project", project.get("projectName", "--")], ["Client", project.get("client", "--")],
+            ["Location", project.get("location", "--")], ["Type", project.get("projectType", "--")],
+            ["Floors / Built area", f"{project.get('floors', '--')} / {project.get('builtArea', '--')} sqm"],
+            ["Start / Completion", f"{project.get('startDate', '--')} → {project.get('completionDate', '--')}"],
+        ]),
+        ("h", "Headline KPIs"),
+        ("table", ["Metric", "Value"], [
+            ["Project health", s.get("health") or "--"], ["CPI", s.get("cpi") or "--"],
+            ["SPI", s.get("spi") or "--"], ["Safety score", s.get("safetyScore") or "--"],
+            ["Budget used", s.get("budgetUsed") or "--"],
+            ["Schedule progress", f"{s['schedule']['progress']}%"],
+        ]),
+        ("h", "Risk intelligence"),
+        ("table", ["Signal", "Score", "Weight", "Contribution"],
+         [[c["name"], c["value"], c["weight"], c["contribution"]] for c in s["risk"]["components"]]),
+        ("p", f"<b>Composite site risk score: {s['risk']['score']} ({s['risk']['grade']})</b>"),
+        ("h", "Safety & PPE"),
+        ("table", ["Metric", "Value"], [
+            ["Incidents logged", (s["safety"]["kpis"] or {}).get("totalIncidentsLogged", "--")],
+            ["High-severity incidents", (s["safety"]["kpis"] or {}).get("highSeverityIncidents", "--")],
+            ["PPE check-ins", s["safety"]["ppeChecks"]], ["PPE violations", s["safety"]["ppeViolations"]],
+        ]),
+        ("h", "Compliance register"),
+        ("table", ["Standard", "Status", "Score", "Last checked"],
+         [[c.get("standard", "--"), c.get("status", "--"), c.get("score", "--"), c.get("lastChecked", "--")]
+          for c in s["compliance"]["items"]]),
+        ("h", "Insurance exposure"),
+        ("table", ["Claim", "Type", "Status", "Exposure"],
+         [[c.get("id", "--"), c.get("claimType", "--"), c.get("status", "--"), c.get("exposureValuation", "--")]
+          for c in s["insurance"]["claims"]]),
+        ("h", "Open mitigation workflows"),
+        ("table", ["Task", "Owner", "Priority", "Status", "Due"],
+         [[w.get("task", "--"), w.get("assignedTo", "--"), w.get("priority", "--"), w.get("status", "--"),
+           w.get("dueDate", "--")] for w in s["workflows"]["items"]]),
+    ]
+    pdf = _pdf_bytes(
+        f"Executive & Compliance Summary — {project.get('projectName', 'Project')}",
+        f"Generated {s['generatedAt'][:19]}Z · Construction Intelligence Hub · Project ID {CURRENT_PROJECT_ID or '--'}",
+        blocks,
+    )
+    db_log_activity("export-executive-summary", None)
+    return _pdf_response(pdf, "executive-summary.pdf")
 
 
 if __name__ == "__main__":

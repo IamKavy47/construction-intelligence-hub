@@ -1,7 +1,9 @@
 import type { ProjectState } from "@/lib/types";
 import { WeatherWidget } from "@/components/WeatherWidget";
+import { PPECheckCard } from "@/components/PPECheckCard";
 import { AlertTriangle, Plus, Loader2, Sparkles } from "lucide-react";
 import { useAnalyzeSafety } from "@/hooks/use-project";
+
 
 export function Safety({
   state,
@@ -57,6 +59,11 @@ export function Safety({
       </div>
 
       <WeatherWidget report={state.weatherReport} />
+
+      <PPECheckCard
+        checks={state.ppeChecks ?? []}
+        defaultLocation={state.project?.location ?? ""}
+      />
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card

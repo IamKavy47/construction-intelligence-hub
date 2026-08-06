@@ -153,6 +153,22 @@ export function useAnalyzeSafety() {
   });
 }
 
+export function useAnalyzePPE() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ image, workerName, location }: { image: File; workerName: string; location: string }) =>
+      api.analyzePPE(image, workerName, location),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["project-state"] });
+      toast[data.check.compliant ? "success" : "error"](
+        data.check.compliant ? "PPE check passed" : `PPE violation: ${data.check.violations.join(", ")}`,
+      );
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
 export function useOptimizeTimeline() {
   const qc = useQueryClient();
   return useMutation({
@@ -161,6 +177,81 @@ export function useOptimizeTimeline() {
       qc.invalidateQueries({ queryKey: ["project-state"] });
       toast.success("Timeline optimized");
     },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+/** Construction Risk Intelligence Engine — weighted score, patterns, predictions. */
+export function useRiskEngine() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.runRiskEngine(),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["project-state"] });
+      qc.invalidateQueries({ queryKey: ["executive-summary"] });
+      toast.success(`Risk score ${data.engine.score} (${data.engine.grade})`);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useExecutiveSummary(enabled = true) {
+  return useQuery({
+    queryKey: ["executive-summary"],
+    queryFn: () => api.executiveSummary(),
+    enabled,
+    retry: 0,
+  });
+}
+
+export function useUpsertWorkflow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (item: Parameters<typeof api.upsertWorkflow>[0]) => api.upsertWorkflow(item),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["executive-summary"] });
+      toast.success("Mitigation task saved");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useDeleteWorkflow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteWorkflow(id),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["executive-summary"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useEscalationScan() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.escalationScan(),
+    onSuccess: (data) => {
+      if (data?.project_state) qc.setQueryData(["project-state"], data.project_state);
+      qc.invalidateQueries({ queryKey: ["executive-summary"] });
+      toast.success(
+        data.fired.length
+          ? `${data.fired.length} escalation${data.fired.length > 1 ? "s" : ""} raised`
+          : "No escalation thresholds breached",
+      );
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+/** Downloads an audit-ready PDF export. */
+export function useExportPdf() {
+  return useMutation({
+    mutationFn: (kind: "daily-report" | "executive-summary") => api.downloadPdf(kind),
+    onSuccess: () => toast.success("PDF downloaded"),
     onError: (e: Error) => toast.error(e.message),
   });
 }

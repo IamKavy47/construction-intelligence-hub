@@ -1,11 +1,12 @@
 import type { ProjectState } from "@/lib/types";
-import { useGenerateReport } from "@/hooks/use-project";
-import { FileText, Loader2, Sparkles, CheckCircle2, AlertCircle, CloudRain, ShieldCheck } from "lucide-react";
+import { useGenerateReport, useExportPdf } from "@/hooks/use-project";
+import { FileText, Loader2, Sparkles, CheckCircle2, AlertCircle, CloudRain, ShieldCheck, Download } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 export function DailyReport({ state }: { state: ProjectState }) {
   const gen = useGenerateReport();
+  const exportPdf = useExportPdf();
   const reports = state.dailyReports ?? [];
   const latest = reports[0];
 
@@ -18,6 +19,21 @@ export function DailyReport({ state }: { state: ProjectState }) {
             AI-authored Daily Progress Reports (DPR) synthesizing weather, materials, risks and safety.
           </p>
         </div>
+        <div className="flex gap-2">
+        {latest && (
+          <button
+            onClick={() => exportPdf.mutate("daily-report")}
+            disabled={exportPdf.isPending}
+            className="px-3 py-2 bg-surface border border-border rounded-lg text-xs font-medium hover:border-primary transition flex items-center gap-2 disabled:opacity-60"
+          >
+            {exportPdf.isPending ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Download className="w-3.5 h-3.5" />
+            )}
+            Export audit PDF
+          </button>
+        )}
         <button
           onClick={() => gen.mutate()}
           disabled={gen.isPending}
@@ -26,6 +42,7 @@ export function DailyReport({ state }: { state: ProjectState }) {
           {gen.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
           Generate Today's Report
         </button>
+        </div>
       </div>
 
       {!latest && (

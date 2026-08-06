@@ -1,0 +1,39 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+requests>=2.32.0
+python-multipart>=0.0.9
+
+# Database
+pymongo[srv]>=4.7.0
+dnspython>=2.6.0
+
+# Vector store & embeddings
+qdrant-client>=1.10.0
+fastembed>=0.3.0
+cohere>=5.5.0
+
+# LangChain / AI orchestration
+langchain-core>=0.2.0
+langchain-mistralai>=0.1.0
+langchain-groq>=0.1.0
+langchain-text-splitters>=0.2.0
+langgraph>=0.2.0
+
+# Document parsing
+pypdf>=4.2.0
+python-docx>=1.1.0
+
+# Google Gemini (PPE / vision analysis)
+google-genai>=1.0.0
+
+# PDF export (audit-ready reports)
+reportlab>=4.1.0
+
+# Utilities
+pandas>=2.2.0
+
+# Sarvam AI (STT/TTS) is called directly over HTTP using `requests` above —
+# no separate Python SDK is required.
+

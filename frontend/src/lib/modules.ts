@@ -13,6 +13,7 @@ export const MODULES: ModuleDef[] = [
   { id: "risk", name: "Risk Intelligence", icon: "ShieldAlert" },
   { id: "safety", name: "Safety Intelligence", icon: "HardHat" },
   { id: "report", name: "Daily Report", icon: "FileText" },
+  { id: "executive", name: "Executive View", icon: "Briefcase" },
   { id: "copilot", name: "Construction Copilot", icon: "Bot" },
 ];
 
@@ -23,6 +24,7 @@ export const AI_SUGGESTIONS: Record<ModuleId | "default", string[]> = {
   risk: ["Analyze top 3 risks", "Wind/storm schedule impact", "Update risk register"],
   safety: ["Identify high risk zones", "Weather-related hazards today", "Generate toolbox talk"],
   report: ["Generate today's DPR", "Summarize last 7 days", "Draft client update email"],
+  executive: ["Summarize project health for the client", "Biggest cost & schedule exposures", "Draft board update"],
   copilot: ["Upload a drawing for clash check", "Summarize uploaded document", "Find missing information"],
   default: ["Analyze data", "Find anomalies", "Generate summary"],
 };

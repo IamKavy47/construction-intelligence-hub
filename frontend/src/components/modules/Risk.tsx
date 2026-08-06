@@ -1,5 +1,7 @@
 import type { ProjectState } from "@/lib/types";
 import { WeatherWidget } from "@/components/WeatherWidget";
+import { RiskEngineCard } from "@/components/RiskEngineCard";
+import { WorkflowBoard } from "@/components/WorkflowBoard";
 import { useAnalyzeRisks } from "@/hooks/use-project";
 import { Loader2, Sparkles } from "lucide-react";
 
@@ -63,6 +65,8 @@ export function Risk({
           </button>
         </div>
       </div>
+
+      <RiskEngineCard engine={state.riskEngine} />
 
       <WeatherWidget report={state.weatherReport} />
 
@@ -162,6 +166,11 @@ export function Risk({
           </div>
         </div>
       </div>
+
+      <WorkflowBoard
+        workflows={state.workflows ?? []}
+        notifications={state.notificationsLog ?? []}
+      />
     </div>
   );
 }

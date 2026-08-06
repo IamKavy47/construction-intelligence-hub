@@ -12,6 +12,7 @@ import { Material } from "@/components/modules/Material";
 import { Risk } from "@/components/modules/Risk";
 import { Safety } from "@/components/modules/Safety";
 import { DailyReport } from "@/components/modules/DailyReport";
+import { Executive } from "@/components/modules/Executive";
 import { Copilot } from "@/components/modules/Copilot";
 import { ProjectSwitcher } from "@/components/ProjectSwitcher";
 import { useProjectState, useChat, useSimulate } from "@/hooks/use-project";
@@ -143,6 +144,7 @@ export function AppShell({ username }: { username?: string | null }) {
           {active === "risk" && <Risk state={state} onAskCopilot={sendChat} />}
           {active === "safety" && <Safety state={state} onLog={logIncident} onAskCopilot={sendChat} />}
           {active === "report" && <DailyReport state={state} />}
+          {active === "executive" && <Executive onAskCopilot={sendChat} />}
           {active === "copilot" && (
             <Copilot
               state={state}

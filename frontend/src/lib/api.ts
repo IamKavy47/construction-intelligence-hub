@@ -1,4 +1,13 @@
-import type { ProjectInfo, ProjectState, DailyReport } from "./types";
+import type {
+  ProjectInfo,
+  ProjectState,
+  DailyReport,
+  PPECheck,
+  RiskEngine,
+  WorkflowItem,
+  ExecutiveSummary,
+  NotificationRecord,
+} from "./types";
 
 export const API_URL =
   (import.meta.env.VITE_BACKEND_URL as string | undefined) ??
@@ -192,6 +201,70 @@ export const api = {
     return handle(
       await fetch(`${API_URL}/api/optimize-timeline`, { method: "POST" }),
     );
+  },
+  /** Gemini vision PPE check on a worker check-in photo. */
+  async analyzePPE(image: File, workerName: string, location: string) {
+    const fd = new FormData();
+    fd.append("file", image);
+    fd.append("workerName", workerName);
+    fd.append("location", location);
+    return handle<{ check: PPECheck; project_state: ProjectState }>(
+      await fetch(`${API_URL}/api/analyze-ppe`, { method: "POST", body: fd }),
+    );
+  },
+  /** Construction Risk Intelligence Engine: weighted score, patterns, predictions. */
+  async runRiskEngine() {
+    return handle<{ engine: RiskEngine; project_state: ProjectState }>(
+      await fetch(`${API_URL}/api/risk-engine`, { method: "POST" }),
+    );
+  },
+  async executiveSummary(): Promise<ExecutiveSummary> {
+    return handle(await fetch(`${API_URL}/api/executive-summary`));
+  },
+  async listWorkflows() {
+    return handle<{ workflows: WorkflowItem[] }>(await fetch(`${API_URL}/api/workflows`));
+  },
+  async upsertWorkflow(item: Partial<WorkflowItem>) {
+    return handle<{ workflow: WorkflowItem; project_state: ProjectState }>(
+      await fetch(`${API_URL}/api/workflows`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      }),
+    );
+  },
+  async deleteWorkflow(id: string) {
+    return handle<{ project_state: ProjectState }>(
+      await fetch(`${API_URL}/api/workflows/${id}`, { method: "DELETE" }),
+    );
+  },
+  /** Runs escalation rules over the live state and fires notifications. */
+  async escalationScan() {
+    return handle<{ fired: NotificationRecord[]; project_state: ProjectState }>(
+      await fetch(`${API_URL}/api/escalate/scan`, { method: "POST" }),
+    );
+  },
+  /** Downloads an audit-ready PDF ("daily-report" or "executive-summary"). */
+  async downloadPdf(kind: "daily-report" | "executive-summary") {
+    const res = await fetch(`${API_URL}/api/export/${kind}`);
+    if (!res.ok) {
+      let detail = `Export failed (${res.status})`;
+      try {
+        detail = (await res.json()).detail || detail;
+      } catch {
+        /* noop */
+      }
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${kind}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   },
   /** Sarvam AI speech-to-text. languageCode "unknown" = auto-detect. */
   async transcribe(audio: Blob, languageCode = "unknown") {

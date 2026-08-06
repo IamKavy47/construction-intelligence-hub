@@ -55,6 +55,21 @@ export interface SafetyHazard {
   severity: "Low" | "Medium" | "High";
   control: string;
 }
+export interface PPECheck {
+  id: string;
+  date: string;
+  worker: string;
+  location: string;
+  compliant: boolean;
+  severity: "Low" | "Medium" | "High";
+  items: Record<string, string>;
+  violations: string[];
+  confidence?: number | null;
+  workerDetected?: boolean;
+  summary: string;
+  recommendation: string;
+  imageName?: string;
+}
 export interface TimelinePhase {
   name: string;
   start: number;   // week offset (0-based)
@@ -112,6 +127,101 @@ export interface DailyReport {
   aiRecommendations: string[];
 }
 
+
+export interface RiskEngineComponent {
+  name: string;
+  value: number;
+  weight: number;
+  contribution: number;
+}
+export interface RiskPattern {
+  kind: string;
+  label: string;
+  occurrences: number;
+  projectsAffected: number;
+  recurring: boolean;
+}
+export interface PredictedIncident {
+  type: string;
+  likelihood: "Low" | "Medium" | "High" | string;
+  window: string;
+  rationale: string;
+}
+export interface EngineRecommendation {
+  action: string;
+  owner?: string;
+  priority?: "Low" | "Medium" | "High" | string;
+  impact?: string;
+}
+export interface RiskEngine {
+  generatedAt: string;
+  score: number;
+  grade: string;
+  components: RiskEngineComponent[];
+  counts: Record<string, number>;
+  patterns: RiskPattern[];
+  outlook: string;
+  predictedIncidents: PredictedIncident[];
+  topDrivers: string[];
+  recommendations: EngineRecommendation[];
+}
+export interface WorkflowItem {
+  id: string;
+  task: string;
+  assignedTo: string;
+  dueDate: string;
+  status: string;
+  priority: string;
+  linkedTo?: string;
+  notes?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+export interface NotificationRecord {
+  id: string;
+  level: string;
+  title: string;
+  body: string;
+  source: string;
+  delivered: string[];
+  createdAt: string;
+}
+export interface ComplianceItem {
+  id: string;
+  standard: string;
+  status: string;
+  lastChecked: string;
+  score: number;
+}
+export interface InsuranceClaim {
+  id: string;
+  policyNumber: string;
+  claimType: string;
+  exposureValuation: number;
+  status: string;
+  filedDate: string;
+}
+export interface ExecutiveSummary {
+  project: ProjectInfo;
+  generatedAt: string;
+  health: number | null;
+  cpi: number | null;
+  spi: number | null;
+  safetyScore: number | null;
+  budgetUsed: string | null;
+  schedule: { phases: number; progress: number; atRiskPhases: number };
+  risk: { score: number; grade: string; components: RiskEngineComponent[]; counts: Record<string, number> };
+  safety: { kpis: SafetyKpis | null; ppeChecks: number; ppeViolations: number };
+  materials: { tracked: number; shortages: number };
+  compliance: { items: ComplianceItem[]; averageScore: number | null; openItems: number };
+  insurance: { claims: InsuranceClaim[]; totalExposure: number };
+  workflows: { total: number; open: number; items: WorkflowItem[] };
+  notifications: NotificationRecord[];
+  reportsFiled: number;
+  latestReport: DailyReport | null;
+  alerts: Alert[];
+}
+
 export interface ProjectState {
   project: ProjectInfo | null;
   health: number | null;
@@ -125,11 +235,17 @@ export interface ProjectState {
   materials: Material[];
   safety: SafetyLog[];
   safetyHazards?: SafetyHazard[];
+  ppeChecks?: PPECheck[];
   timeline?: TimelinePhase[];
   weatherReport: WeatherReport | null;
   chatHistory: ChatMessage[];
   safetyKpis: SafetyKpis | null;
   dailyReports?: DailyReport[];
+  riskEngine?: RiskEngine | null;
+  workflows?: WorkflowItem[];
+  notificationsLog?: NotificationRecord[];
+  complianceChecklist?: ComplianceItem[];
+  insuranceClaims?: InsuranceClaim[];
 }
 
 export type ModuleId =
@@ -139,4 +255,5 @@ export type ModuleId =
   | "risk"
   | "safety"
   | "report"
+  | "executive"
   | "copilot";
