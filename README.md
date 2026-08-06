@@ -338,6 +338,3 @@ The app uses a simple server-side session for the demo:
 - [ ] True side-by-side multi-project portfolio dashboard
 - [ ] Compliance-only and Insurance-only standalone modules
 
----
-
-Built by **Team A** for the Construction Intelligence Hub project.
