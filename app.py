@@ -48,6 +48,9 @@ def empty_state() -> Dict[str, Any]:
         "equipment": [],
         "workforce": [],
         "safety": [],
+        "safetyHazards": [],
+        "timeline": [],
+        "dailyReports": [],
         "weatherReport": None,
         "chatHistory": [],
           "notificationsLog": [],
@@ -564,7 +567,10 @@ _NEW_ITEM_TEMPLATES = {
     # --- NEW TEMPLATES ---
     "compliance": lambda kid: {"id": kid, "standard": kid, "status": "Reviewing", "lastChecked": date.today().isoformat(), "score": 50},
     "insurance": lambda kid: {"id": kid, "policyNumber": "TBD", "claimType": "TBD", "exposureValuation": 0.0, "status": "New", "filedDate": date.today().isoformat()},
-    "workflows": lambda kid: {"id": kid, "task": kid, "assignedTo": "Unassigned", "dueDate": "", "status": "Open"}
+    "workflows": lambda kid: {"id": kid, "task": kid, "assignedTo": "Unassigned", "dueDate": "", "status": "Open"},
+    "safetyHazards": lambda kid: {"id": kid, "hazard": "", "location": "Site Wide", "likelihood": "Medium", "severity": "Medium", "control": ""},
+    "timeline": lambda kid: {"name": kid, "start": 0, "length": 4, "status": "planned", "progress": 0, "risk": "Low", "note": ""},
+
 }
 
 @tool
@@ -617,7 +623,7 @@ def update_project_data(category: str, key_or_id: str, field: str, value: str) -
             return f"Error: Category '{category}' cannot be modified dynamically."
 
         items = PROJECT_STATE.setdefault(category, [])
-        id_field = {"materials": "sku", "workforce": "trade"}.get(category, "id")
+        id_field = {"materials": "sku", "workforce": "trade", "timeline": "name"}.get(category, "id")
 
         for item in items:
             if item.get(id_field) == key_or_id:
@@ -715,12 +721,8 @@ def _get_llm():
     return llm.bind_tools(ALL_TOOLS)
 
 
-def agent_node(state: GraphState):
-    messages = state["messages"]
-    active_module = state["active_module"]
-    llm_with_tools = _get_llm()
-
-    system_prompt = SystemMessage(content=with_guardrails(
+def _agent_system_prompt(active_module: str) -> SystemMessage:
+    return SystemMessage(content=with_guardrails(
         "You are the core AI engine of the Construction Intelligence Hub. The user is JD "
         "(John Doe, Principal Architect). The active module tab is: "
         f"{active_module}.\nThe project info is: {json.dumps(PROJECT_STATE.get('project'))}\n\n"
@@ -745,7 +747,11 @@ def agent_node(state: GraphState):
         "updates you actually performed (or state plainly that none were needed)."
     ))
 
-    response = llm_with_tools.invoke([system_prompt] + list(messages))
+
+def agent_node(state: GraphState):
+    messages = state["messages"]
+    llm_with_tools = _get_llm()
+    response = llm_with_tools.invoke([_agent_system_prompt(state["active_module"])] + list(messages))
     return {"messages": [response]}
 
 
@@ -1080,6 +1086,117 @@ def chat_copilot(payload: ChatPayload):
     return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
 
 
+# -------------------------------------------------------------------------------------
+# STREAMING CHAT  (Server-Sent Events)
+# Same agent, same tools, same guardrails -- but the reply is emitted token by token so
+# the Copilot types the answer out live instead of waiting for the whole run.
+# Event types: token | tools | reset | done | error
+# -------------------------------------------------------------------------------------
+def _sse(event: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def _stream_agent(message: str, active_module: str):
+    """Runs the agent loop manually so LLM tokens can be forwarded as they arrive."""
+    history: List[BaseMessage] = []
+    for msg in PROJECT_STATE["chatHistory"][-10:]:
+        if msg["role"] == "user":
+            history.append(HumanMessage(content=msg["text"]))
+        elif msg["role"] == "bot":
+            history.append(AIMessage(content=msg["text"]))
+
+    PROJECT_STATE["chatHistory"].append({"role": "user", "text": message})
+    db_log_chat("user", message, active_module)
+
+    llm_with_tools = _get_llm()
+    messages: List[BaseMessage] = history + [HumanMessage(content=message)]
+    final_text = ""
+
+    for _ in range(8):  # tool-loop guard, mirrors the graph's recursion limit
+        assembled = None
+        streamed = ""
+        for chunk in llm_with_tools.stream([_agent_system_prompt(active_module)] + messages):
+            assembled = chunk if assembled is None else assembled + chunk
+            piece = chunk.content if isinstance(chunk.content, str) else ""
+            if piece:
+                streamed += piece
+                yield _sse({"type": "token", "text": piece})
+
+        if assembled is None:
+            break
+        messages.append(assembled)
+        tool_calls = getattr(assembled, "tool_calls", None)
+
+        if not tool_calls:
+            final_text = streamed or (assembled.content if isinstance(assembled.content, str) else "")
+            break
+
+        # Whatever was streamed before a tool call is thinking-out-loud, not the answer.
+        if streamed:
+            yield _sse({"type": "reset"})
+        yield _sse({"type": "tools", "names": [t["name"] for t in tool_calls]})
+
+        for tool_call in tool_calls:
+            name, args, tool_id = tool_call["name"], tool_call["args"], tool_call["id"]
+            logger.info(f"Invoking tool: {name} with {args}")
+            if name in TOOLS_BY_NAME:
+                try:
+                    result = TOOLS_BY_NAME[name].invoke(args)
+                except Exception as e:
+                    result = f"Error executing tool {name}: {str(e)}"
+            else:
+                result = f"Tool '{name}' is not registered."
+            messages.append(ToolMessage(content=str(result), tool_call_id=tool_id, name=name))
+
+    if not final_text:
+        final_text = "I couldn't complete that request — please try rephrasing it."
+
+    PROJECT_STATE["chatHistory"].append({"role": "bot", "text": final_text})
+    db_log_chat("bot", final_text, active_module)
+    db_save_state()
+
+    state = dict(PROJECT_STATE)
+    state["safetyKpis"] = compute_safety_kpis()
+    yield _sse({"type": "done", "response": final_text, "project_state": state})
+
+
+@app.post("/api/chat/stream")
+def chat_copilot_stream(payload: ChatPayload):
+    from fastapi.responses import StreamingResponse
+
+    logger.info(f"User message (stream): {payload.message} (module: {payload.active_module})")
+
+    def generate():
+        if not is_on_topic(payload.message):
+            PROJECT_STATE["chatHistory"].append({"role": "user", "text": payload.message})
+            PROJECT_STATE["chatHistory"].append({"role": "bot", "text": REFUSAL})
+            db_log_chat("user", payload.message, payload.active_module)
+            db_log_chat("bot", REFUSAL, payload.active_module)
+            db_save_state()
+            state = dict(PROJECT_STATE)
+            state["safetyKpis"] = compute_safety_kpis()
+            yield _sse({"type": "token", "text": REFUSAL})
+            yield _sse({"type": "done", "response": REFUSAL, "project_state": state})
+            return
+        try:
+            for event in _stream_agent(payload.message, payload.active_module):
+                yield event
+        except AgentUnavailable as e:
+            yield _sse({"type": "error", "detail": str(e)})
+        except Exception as e:
+            logger.error(f"Streaming chat failed: {e}")
+            yield _sse({"type": "error", "detail": f"AI engine error: {e}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+
+
+
 @app.post("/api/upload")
 def upload_document(
     file: UploadFile = File(...),
@@ -1317,6 +1434,341 @@ def estimate_materials():
         raise HTTPException(status_code=502, detail=f"Material estimation failed: {e}")
 
     return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
+
+# =====================================================================================
+# AI ANALYSIS ENDPOINTS -- Risk, Safety, Timeline, Daily Report
+# All four run through the same guarded LangGraph/Mistral agent, so anything they
+# produce is written straight into PROJECT_STATE via the agent's tools.
+# =====================================================================================
+def _run_module_agent(prompt: str, module: str, label: str) -> str:
+    try:
+        return run_agent(prompt, active_module=module)
+    except AgentUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"{label} failed: {e}")
+        raise HTTPException(status_code=502, detail=f"{label} failed: {e}")
+
+
+def _require_project() -> Dict[str, Any]:
+    project = PROJECT_STATE.get("project")
+    if not project:
+        raise HTTPException(status_code=400, detail="No active project. Initialize a project first.")
+    return project
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    """Pulls the first JSON object out of an LLM reply (handles ```json fences)."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        for p in parts:
+            p = p.strip()
+            if p.lower().startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{"):
+                cleaned = p
+                break
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(cleaned[start:end + 1])
+    except Exception:
+        return None
+
+
+@app.post("/api/analyze-risks")
+def analyze_risks():
+    """AI risk analysis: scans the live project data and updates the risk register."""
+    project = _require_project()
+    prompt = (
+        f"Run a full RISK ANALYSIS for this project:\n{json.dumps(project, indent=2)}\n\n"
+        "Steps: (1) call get_project_data(category='all') to read the live data, "
+        "(2) call vector_store_retrieval for any uploaded specification/drawing detail that "
+        "affects risk, (3) call weather_lookup for the project location if weather could be a "
+        "driver. Then use update_project_data(category='risks', ...) to add any missing risks "
+        "and to refresh 'prob', 'impact', 'status', 'category', 'mitigation' and a numeric "
+        "'score' (1-25 = probability x impact) on existing ones. Add a danger or warning alert "
+        "for anything critical via add_alert. Finish with a short prioritized summary of the top "
+        "risks and their mitigations."
+    )
+    ai_response = _run_module_agent(prompt, "risk", "Risk analysis")
+    PROJECT_STATE["chatHistory"].append({"role": "bot", "text": f"🛑 **AI Risk Analysis:** {ai_response}"})
+    db_log_activity("analyze-risks", ai_response[:500])
+    return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
+
+
+@app.post("/api/analyze-safety")
+def analyze_safety():
+    """AI safety analysis: predicts hazards, fills the hazard register, recomputes KPIs."""
+    project = _require_project()
+    prompt = (
+        f"Run a SAFETY ANALYSIS for this project:\n{json.dumps(project, indent=2)}\n\n"
+        "Steps: (1) call get_project_data(category='safety') and get_project_data(category='all'), "
+        "(2) call weather_lookup for the project location, (3) call vector_store_retrieval for "
+        "site/method details in the uploaded documents. Then predict the most likely hazards for "
+        "the current construction stage and record each one with "
+        "update_project_data(category='safetyHazards', key_or_id='HZ-01', field=...) setting "
+        "'hazard', 'location', 'likelihood', 'severity' and a concrete OSHA-aligned 'control'. "
+        "Update metrics safetyScore if warranted and add alerts for high-severity hazards. "
+        "Finish with a short safety briefing for the site team."
+    )
+    ai_response = _run_module_agent(prompt, "safety", "Safety analysis")
+    PROJECT_STATE["safetyKpis"] = compute_safety_kpis()
+    PROJECT_STATE["chatHistory"].append({"role": "bot", "text": f"🦺 **AI Safety Analysis:** {ai_response}"})
+    db_log_activity("analyze-safety", ai_response[:500])
+    return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
+
+
+@app.post("/api/optimize-timeline")
+def optimize_timeline():
+    """AI schedule optimization: builds or rebalances the phase timeline."""
+    project = _require_project()
+    prompt = (
+        f"Build or OPTIMIZE THE CONSTRUCTION SCHEDULE for this project:\n"
+        f"{json.dumps(project, indent=2)}\n\n"
+        "Steps: (1) call get_project_data(category='timeline') to see existing phases and "
+        "get_project_data(category='all') for progress, risks and materials, (2) call "
+        "vector_store_retrieval for scope detail from the uploaded construction document. "
+        "Then, for each major phase (e.g. Mobilization, Foundation, Substructure, Superstructure, "
+        "MEP Rough-in, Envelope, Finishes, Testing & Handover), call "
+        "update_project_data(category='timeline', key_or_id='<phase name>', field=...) to set "
+        "'start' (week offset, integer), 'length' (weeks, integer), 'status' "
+        "(complete|active|planned), 'progress' (0-100), 'risk' (Low|Medium|High) and a short "
+        "'note'. Keep the phases consistent with the project's start and completion dates. "
+        "Finish by explaining the critical path and where time can be recovered."
+    )
+    ai_response = _run_module_agent(prompt, "timeline", "Timeline optimization")
+    PROJECT_STATE["chatHistory"].append({"role": "bot", "text": f"📅 **AI Timeline Optimization:** {ai_response}"})
+    db_log_activity("optimize-timeline", ai_response[:500])
+    return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
+
+
+@app.post("/api/generate-daily-report")
+def generate_daily_report():
+    """AI daily progress report, grounded in the live project state and weather."""
+    project = _require_project()
+    prompt = (
+        f"Generate today's DAILY SITE PROGRESS REPORT for this project:\n"
+        f"{json.dumps(project, indent=2)}\n\n"
+        "First call get_project_data(category='all') and weather_lookup for the project "
+        "location. Base every statement on that real data -- never invent figures. "
+        "Then reply with ONLY a JSON object, no prose and no code fence, in exactly this shape:\n"
+        '{"date": "YYYY-MM-DD", "summary": "...", "progress": "e.g. 42%", '
+        '"workDone": ["..."], "workPlanned": ["..."], "issues": ["..."], '
+        '"weatherImpact": "...", "safetyNotes": "...", "aiRecommendations": ["..."]}'
+    )
+    ai_response = _run_module_agent(prompt, "report", "Daily report generation")
+
+    parsed = _extract_json(ai_response) or {}
+    report = {
+        "date": str(parsed.get("date") or date.today().isoformat()),
+        "summary": str(parsed.get("summary") or ai_response)[:4000],
+        "progress": str(parsed.get("progress") or "N/A"),
+        "workDone": [str(x) for x in (parsed.get("workDone") or [])],
+        "workPlanned": [str(x) for x in (parsed.get("workPlanned") or [])],
+        "issues": [str(x) for x in (parsed.get("issues") or [])],
+        "weatherImpact": str(parsed.get("weatherImpact") or ""),
+        "safetyNotes": str(parsed.get("safetyNotes") or ""),
+        "aiRecommendations": [str(x) for x in (parsed.get("aiRecommendations") or [])],
+    }
+
+    reports = PROJECT_STATE.setdefault("dailyReports", [])
+    reports.insert(0, report)
+    PROJECT_STATE["dailyReports"] = reports[:60]
+    db_save_daily_report(report)
+    db_log_activity("generate-daily-report", report["summary"][:500])
+
+    return {"status": "success", "report": report, "project_state": PROJECT_STATE}
+
+
+# =====================================================================================
+# VOICE — Sarvam AI  (multilingual STT + TTS for Indian languages)
+# STT: saaras:v4 with language_code="unknown" => auto language detection (mode=translate
+#      also normalises regional speech into clean text the agent can reason over).
+# TTS: bulbul:v3, 500-char cap per input, so long text is chunked and concatenated.
+# The API key never leaves the server; the browser only talks to these two endpoints.
+# =====================================================================================
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v4")
+SARVAM_STT_MODE = os.getenv("SARVAM_STT_MODE", "translate")
+SARVAM_STT_SAMPLE_RATE = os.getenv("SARVAM_STT_SAMPLE_RATE", "16000")
+SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "soham")
+SARVAM_TTS_PACE = float(os.getenv("SARVAM_TTS_PACE", "1"))
+SARVAM_TTS_SAMPLE_RATE = int(os.getenv("SARVAM_TTS_SAMPLE_RATE", "22050"))
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
+
+
+def _sarvam_keys() -> List[str]:
+    """Primary key plus fallbacks. SARVAM_API_KEY is tried first, then
+    SARVAM_API_KEY2 and SARVAM_API_KEY3 — so a rate-limited or exhausted
+    key never takes voice features down."""
+    keys = [
+        (os.getenv("SARVAM_API_KEY") or "").strip(),
+        (os.getenv("SARVAM_API_KEY2") or "").strip(),
+        (os.getenv("SARVAM_API_KEY3") or "").strip(),
+    ]
+    out: List[str] = []
+    for k in keys:
+        if k and k not in out:
+            out.append(k)
+    if not out:
+        raise HTTPException(
+            status_code=503,
+            detail="No Sarvam key configured (set SARVAM_API_KEY, optionally SARVAM_API_KEY2/3).",
+        )
+    return out
+
+
+# 401/403 = bad key, 402 = out of credits, 429 = rate limited, 5xx = upstream trouble.
+# All of those are worth retrying on the next key; a 400 (bad audio/text) is not.
+_SARVAM_FAILOVER_CODES = {401, 402, 403, 429, 500, 502, 503, 504}
+
+
+def _sarvam_call(send, what: str):
+    """Runs `send(key)` against each configured Sarvam key until one succeeds."""
+    keys = _sarvam_keys()
+    last_status, last_detail = 502, f"{what} failed."
+    for idx, key in enumerate(keys, start=1):
+        label = "SARVAM_API_KEY" if idx == 1 else f"SARVAM_API_KEY{idx}"
+        try:
+            resp = send(key)
+        except Exception as e:
+            logger.error(f"Sarvam {what} request failed on {label}: {e}")
+            last_status, last_detail = 502, f"{what} request failed: {e}"
+            continue
+
+        if resp.status_code < 400:
+            if idx > 1:
+                logger.info(f"Sarvam {what} served by fallback {label}.")
+            return resp
+
+        last_status, last_detail = resp.status_code, f"Sarvam {what} error: {resp.text[:300]}"
+        logger.error(f"Sarvam {what} error {resp.status_code} on {label}: {resp.text[:400]}")
+        if resp.status_code not in _SARVAM_FAILOVER_CODES:
+            break   # our fault (bad input) — another key won't help
+        if idx < len(keys):
+            logger.warning(f"Sarvam {what}: failing over from {label} to the next key.")
+
+    raise HTTPException(status_code=last_status, detail=last_detail)
+
+
+class TTSPayload(BaseModel):
+    text: str
+    target_language_code: str = "en-IN"
+    speaker: Optional[str] = None
+
+
+@app.post("/api/stt")
+async def speech_to_text(
+    file: UploadFile = File(...),
+    language_code: str = Form("unknown"),
+):
+    """Transcribes a recorded clip with Sarvam AI. language_code='unknown' lets Sarvam
+    auto-detect the spoken Indian language (hi, mr, ta, te, bn, gu, kn, ml, pa, en...)."""
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="Empty recording — please record again.")
+    if len(audio) < 2048:
+        raise HTTPException(status_code=400, detail="That recording was too short — please try again.")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Recording is too large (max 20 MB).")
+
+    resp = _sarvam_call(
+        lambda key: requests.post(
+            SARVAM_STT_URL,
+            headers={"api-subscription-key": key},
+            files={"file": (file.filename or "recording.wav", audio, file.content_type or "audio/wav")},
+            data={
+                "model": SARVAM_STT_MODEL,
+                "language_code": language_code or "unknown",
+                "mode": SARVAM_STT_MODE,
+                "sample_rate": SARVAM_STT_SAMPLE_RATE,
+            },
+            timeout=120,
+        ),
+        "STT",
+    )
+
+    data = resp.json()
+    transcript = (data.get("transcript") or "").strip()
+    detected = data.get("language_code") or language_code
+    if not transcript:
+        raise HTTPException(status_code=400, detail="No speech detected in that recording.")
+
+    logger.info(f"STT ok ({detected}): {transcript[:120]}")
+    db_log_activity("stt", f"[{detected}] {transcript[:300]}")
+    return {"status": "success", "transcript": transcript, "language_code": detected}
+
+
+def _tts_chunks(text: str, limit: int = 480) -> List[str]:
+    """Splits on sentence boundaries so no chunk exceeds Sarvam's per-input cap."""
+    import re
+    sentences = re.findall(r"[^.!?।\n]+[.!?।\n]*", text) or [text]
+    chunks: List[str] = []
+    current = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > limit:
+            if current:
+                chunks.append(current); current = ""
+            for i in range(0, len(s), limit):
+                chunks.append(s[i:i + limit])
+            continue
+        if current and len(current) + len(s) + 1 > limit:
+            chunks.append(current); current = ""
+        current = f"{current} {s}".strip()
+    if current:
+        chunks.append(current)
+    return chunks[:12]   # hard cap so one reply can't fan out into dozens of calls
+
+
+@app.post("/api/tts")
+def text_to_speech(payload: TTSPayload):
+    """Speaks a Copilot reply with Sarvam AI. Returns base64 WAV segments in order."""
+    _sarvam_keys()   # fail fast with a clear message if nothing is configured
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Nothing to speak.")
+
+    # Strip markdown noise so the voice doesn't read out asterisks and pipes.
+    import re
+    clean = re.sub(r"[*_`#>|]+", " ", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    audios: List[str] = []
+    for chunk in _tts_chunks(clean):
+        body = {
+            "text": chunk,
+            "target_language_code": payload.target_language_code or "en-IN",
+            "speaker": payload.speaker or SARVAM_TTS_SPEAKER,
+            "model": SARVAM_TTS_MODEL,
+            "pace": SARVAM_TTS_PACE,
+            "speech_sample_rate": SARVAM_TTS_SAMPLE_RATE,
+        }
+        resp = _sarvam_call(
+            lambda key, body=body: requests.post(
+                SARVAM_TTS_URL,
+                headers={"api-subscription-key": key, "Content-Type": "application/json"},
+                json=body,
+                timeout=120,
+            ),
+            "TTS",
+        )
+        audios.extend(resp.json().get("audios") or [])
+
+    if not audios:
+        raise HTTPException(status_code=502, detail="Sarvam returned no audio for this text.")
+
+    return {"status": "success", "format": "wav", "audios": audios}
+
 
 
 # =====================================================================================
