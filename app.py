@@ -50,6 +50,18 @@ def empty_state() -> Dict[str, Any]:
         "safety": [],
         "weatherReport": None,
         "chatHistory": [],
+          "notificationsLog": [],
+        "historicalRisks": [],
+        "complianceChecklist": [
+            {"id": "COMP-01", "standard": "OSHA 1926 (Fall Protection)", "status": "Compliant", "lastChecked": date.today().isoformat(), "score": 100},
+            {"id": "COMP-02", "standard": "EPA Clean Water Act (Stormwater)", "status": "Pending Verification", "lastChecked": date.today().isoformat(), "score": 80},
+            {"id": "COMP-03", "standard": "IBC 2024 (Structural Integrity)", "status": "Reviewing", "lastChecked": date.today().isoformat(), "score": 90}
+        ],
+        "insuranceClaims": [
+            {"id": "CLM-001", "policyNumber": "POL-CIVIL-998A", "claimType": "Property/Storm Damage", "exposureValuation": 45000.0, "status": "Under Review", "filedDate": date.today().isoformat()}
+        ],
+        "workflows": []      # Mitigation task assignments, owners, and due dates
+    
     }
 
 PROJECT_STATE: Dict[str, Any] = empty_state()
@@ -548,7 +560,11 @@ _NEW_ITEM_TEMPLATES = {
     "equipment": lambda kid: {"id": kid, "type": "TBD", "model": "TBD", "status": "Planned", "operator": "Unassigned", "fuel": "N/A", "utilization": 0},
     "workforce": lambda kid: {"trade": kid, "contractor": "TBD", "headcount": 0, "plan": 0, "variance": "0", "productivity": "N/A"},
     "risks": lambda kid: {"id": kid, "desc": "", "prob": "Medium", "impact": "Medium", "status": "New"},
-    "safety": lambda kid: {"id": kid, "date": date.today().isoformat(), "type": "Incident", "location": "Site Wide", "desc": "", "severity": "Medium"},
+    "safety": lambda kid: {"id": kid, "date": date.today().isoformat(), "type": "Incident", "location": "Site Wide", "desc": "", "severity": "Medium", "owner": "TBD", "escalationLevel": 0},
+    # --- NEW TEMPLATES ---
+    "compliance": lambda kid: {"id": kid, "standard": kid, "status": "Reviewing", "lastChecked": date.today().isoformat(), "score": 50},
+    "insurance": lambda kid: {"id": kid, "policyNumber": "TBD", "claimType": "TBD", "exposureValuation": 0.0, "status": "New", "filedDate": date.today().isoformat()},
+    "workflows": lambda kid: {"id": kid, "task": kid, "assignedTo": "Unassigned", "dueDate": "", "status": "Open"}
 }
 
 @tool
