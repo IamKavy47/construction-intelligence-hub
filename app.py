@@ -53,6 +53,194 @@ def empty_state() -> Dict[str, Any]:
     }
 
 PROJECT_STATE: Dict[str, Any] = empty_state()
+CURRENT_PROJECT_ID: Optional[str] = None
+
+# =====================================================================================
+# PERSISTENCE: MongoDB (pymongo, sync -- matches these sync endpoints)
+# The whole app is document-shaped (project baseline, risks, materials, safety logs,
+# chat history, uploaded-document metadata), so MongoDB is the only database used here.
+# Collections:
+#   projects       -> one document per project: the wizard input + the full live state
+#   chat_messages  -> append-only copy of every copilot message (audit trail)
+#   documents      -> metadata for every uploaded construction document
+#   daily_reports  -> AI-authored daily progress reports
+#   activity_log   -> which API action ran, when, and against which project
+# If MONGODB_URI is missing or the server is unreachable the app keeps running fully
+# in-memory and logs a warning -- persistence degrades, features do not.
+# =====================================================================================
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017")
+MONGODB_DB = os.getenv("MONGODB_DB", "construction_intelligence_hub")
+
+_mongo_client = None
+_mongo_db = None
+_mongo_error: Optional[str] = None
+
+
+def get_db():
+    """Returns the MongoDB database handle, or None if Mongo is unavailable."""
+    global _mongo_client, _mongo_db, _mongo_error
+    if _mongo_db is not None:
+        return _mongo_db
+    if _mongo_error is not None:
+        return None
+    try:
+        from pymongo import MongoClient, ASCENDING, DESCENDING
+
+        _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000, tz_aware=False)
+        _mongo_client.admin.command("ping")
+        _mongo_db = _mongo_client[MONGODB_DB]
+        _mongo_db.projects.create_index([("updatedAt", DESCENDING)])
+        _mongo_db.chat_messages.create_index([("projectId", ASCENDING), ("createdAt", ASCENDING)])
+        _mongo_db.documents.create_index([("projectId", ASCENDING), ("uploadedAt", DESCENDING)])
+        _mongo_db.daily_reports.create_index([("projectId", ASCENDING), ("reportDate", DESCENDING)])
+        _mongo_db.activity_log.create_index([("createdAt", DESCENDING)])
+        logger.info(f"MongoDB connected: db='{MONGODB_DB}'")
+        return _mongo_db
+    except Exception as e:
+        _mongo_error = str(e)
+        logger.warning(f"MongoDB unavailable, running in-memory only: {e}")
+        return None
+
+
+def _now() -> datetime:
+    return datetime.utcnow()
+
+
+def db_start_project(info: Dict[str, Any]) -> str:
+    """Creates the project document and makes it the active one."""
+    global CURRENT_PROJECT_ID
+    project_id = f"PRJ-{_now().strftime('%Y%m%d%H%M%S')}"
+    CURRENT_PROJECT_ID = project_id
+    db = get_db()
+    if db is None:
+        return project_id
+    try:
+        db.projects.insert_one({
+            "_id": project_id,
+            "project": info,
+            "state": PROJECT_STATE,
+            "createdAt": _now(),
+            "updatedAt": _now(),
+        })
+    except Exception as e:
+        logger.warning(f"Mongo: failed to create project document: {e}")
+    return project_id
+
+
+def db_save_state() -> None:
+    """Upserts the full live state of the active project."""
+    if CURRENT_PROJECT_ID is None:
+        return
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.projects.update_one(
+            {"_id": CURRENT_PROJECT_ID},
+            {"$set": {
+                "project": PROJECT_STATE.get("project"),
+                "state": PROJECT_STATE,
+                "updatedAt": _now(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        logger.warning(f"Mongo: failed to save state: {e}")
+
+
+def db_log_chat(role: str, text: str, module: Optional[str] = None,
+                attachment: Optional[Dict[str, Any]] = None) -> None:
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.chat_messages.insert_one({
+            "projectId": CURRENT_PROJECT_ID, "role": role, "text": text,
+            "module": module, "attachment": attachment, "createdAt": _now(),
+        })
+    except Exception as e:
+        logger.warning(f"Mongo: failed to log chat message: {e}")
+
+
+def db_log_document(record: Dict[str, Any], extracted_chars: int, indexed: bool) -> None:
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.documents.insert_one({
+            **record, "projectId": CURRENT_PROJECT_ID,
+            "extractedChars": extracted_chars, "indexed": indexed, "createdAt": _now(),
+        })
+    except Exception as e:
+        logger.warning(f"Mongo: failed to log document: {e}")
+
+
+def db_save_daily_report(report: Dict[str, Any]) -> None:
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.daily_reports.insert_one({
+            "projectId": CURRENT_PROJECT_ID,
+            "reportDate": report.get("date") or date.today().isoformat(),
+            "report": report, "createdAt": _now(),
+        })
+    except Exception as e:
+        logger.warning(f"Mongo: failed to save daily report: {e}")
+
+
+def db_log_activity(action: str, detail: Optional[str] = None) -> None:
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.activity_log.insert_one({
+            "projectId": CURRENT_PROJECT_ID, "action": action,
+            "detail": detail, "createdAt": _now(),
+        })
+    except Exception as e:
+        logger.warning(f"Mongo: failed to log activity: {e}")
+
+
+def db_load_latest_project() -> bool:
+    """Restores the most recently updated project so a restart doesn't lose the site."""
+    global PROJECT_STATE, CURRENT_PROJECT_ID
+    db = get_db()
+    if db is None:
+        return False
+    try:
+        doc = db.projects.find_one(sort=[("updatedAt", -1)])
+        if not doc or not doc.get("state"):
+            return False
+        restored = empty_state()
+        restored.update({k: v for k, v in doc["state"].items() if k in restored})
+        PROJECT_STATE = restored
+        CURRENT_PROJECT_ID = doc["_id"]
+        logger.info(f"Restored project '{CURRENT_PROJECT_ID}' from MongoDB.")
+        return True
+    except Exception as e:
+        logger.warning(f"Mongo: failed to restore latest project: {e}")
+        return False
+
+
+@app.on_event("startup")
+def _restore_state_on_startup():
+    db_load_latest_project()
+
+
+@app.middleware("http")
+async def _persist_after_write(request, call_next):
+    """Every successful state-changing API call is written through to MongoDB."""
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if request.method == "POST" and path.startswith("/api/") and response.status_code < 400:
+            db_log_activity(path)
+            db_save_state()
+    except Exception as e:
+        logger.warning(f"Mongo: post-request persistence failed: {e}")
+    return response
+
 
 # =====================================================================================
 # VECTOR STORE: Qdrant native hybrid search (dense + sparse, RRF fusion) with
@@ -735,6 +923,7 @@ def init_project(info: ProjectInfo):
     logger.info(f"Initializing new project: {info.projectName}")
     PROJECT_STATE = empty_state()
     PROJECT_STATE["project"] = info.model_dump()
+    db_start_project(info.model_dump())
 
     if not info.hasDocument:
         # Only wipe the index when no construction document was uploaded by the wizard.
@@ -851,9 +1040,12 @@ def chat_copilot(payload: ChatPayload):
     if not is_on_topic(payload.message):
         PROJECT_STATE["chatHistory"].append({"role": "user", "text": payload.message})
         PROJECT_STATE["chatHistory"].append({"role": "bot", "text": REFUSAL})
+        db_log_chat("user", payload.message, payload.active_module)
+        db_log_chat("bot", REFUSAL, payload.active_module)
         return {"status": "success", "response": REFUSAL, "project_state": PROJECT_STATE}
 
     PROJECT_STATE["chatHistory"].append({"role": "user", "text": payload.message})
+    db_log_chat("user", payload.message, payload.active_module)
 
     try:
         result = compiled_graph.invoke({
@@ -868,6 +1060,7 @@ def chat_copilot(payload: ChatPayload):
         raise HTTPException(status_code=502, detail=f"AI engine error: {e}")
 
     PROJECT_STATE["chatHistory"].append({"role": "bot", "text": ai_response})
+    db_log_chat("bot", ai_response, payload.active_module)
     return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
 
 
@@ -951,6 +1144,7 @@ def upload_document(
         "uploadedAt": datetime.utcnow().isoformat(),
     }
     PROJECT_STATE["uploadedDocuments"].insert(0, doc_record)
+    db_log_document(doc_record, len(text_content.strip()), False)
     if not silent:
         PROJECT_STATE["chatHistory"].append({"role": "user", "text": f"Uploaded document: {filename}", "attachment": doc_record})
 
@@ -1014,6 +1208,7 @@ def upload_document(
         ai_response = f"⚠️ **Document was stored, but AI analysis failed:** {e}"
 
     PROJECT_STATE["chatHistory"].append({"role": "bot", "text": ai_response})
+    db_log_chat("bot", ai_response, "copilot")
     return {"status": "success", "attachment": doc_record, "analysis": ai_response, "project_state": PROJECT_STATE}
 
 
@@ -1106,6 +1301,102 @@ def estimate_materials():
         raise HTTPException(status_code=502, detail=f"Material estimation failed: {e}")
 
     return {"status": "success", "response": ai_response, "project_state": PROJECT_STATE}
+
+
+# =====================================================================================
+# MONGODB-BACKED HISTORY ENDPOINTS
+# Everything the app has ever written is queryable, so the UI (or an auditor) can look
+# past the current in-memory session.
+# =====================================================================================
+def _require_db():
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail=f"MongoDB unavailable: {_mongo_error}")
+    return db
+
+
+@app.get("/api/db/status")
+def db_status():
+    db = get_db()
+    return {
+        "connected": db is not None,
+        "database": MONGODB_DB if db is not None else None,
+        "activeProjectId": CURRENT_PROJECT_ID,
+        "error": _mongo_error,
+    }
+
+
+@app.get("/api/db/projects")
+def list_projects(limit: int = 25):
+    db = _require_db()
+    docs = list(db.projects.find({}, {"project": 1, "createdAt": 1, "updatedAt": 1})
+                .sort("updatedAt", -1).limit(limit))
+    return {"projects": [{
+        "id": d["_id"],
+        "project": d.get("project"),
+        "createdAt": (d.get("createdAt") or _now()).isoformat(),
+        "updatedAt": (d.get("updatedAt") or _now()).isoformat(),
+    } for d in docs]}
+
+
+@app.post("/api/db/load-project/{project_id}")
+def load_project(project_id: str):
+    """Makes a previously saved project the active one again."""
+    global PROJECT_STATE, CURRENT_PROJECT_ID
+    db = _require_db()
+    doc = db.projects.find_one({"_id": project_id})
+    if not doc or not doc.get("state"):
+        raise HTTPException(status_code=404, detail="Project not found.")
+    restored = empty_state()
+    restored.update({k: v for k, v in doc["state"].items() if k in restored})
+    PROJECT_STATE = restored
+    CURRENT_PROJECT_ID = project_id
+    state = dict(PROJECT_STATE)
+    state["safetyKpis"] = compute_safety_kpis()
+    return {"status": "success", "project_state": state}
+
+
+@app.get("/api/db/chat-history")
+def db_chat_history(project_id: Optional[str] = None, limit: int = 200):
+    db = _require_db()
+    pid = project_id or CURRENT_PROJECT_ID
+    docs = list(db.chat_messages.find({"projectId": pid}, {"_id": 0})
+                .sort("createdAt", 1).limit(limit))
+    for d in docs:
+        d["createdAt"] = d["createdAt"].isoformat()
+    return {"messages": docs}
+
+
+@app.get("/api/db/documents")
+def db_documents(project_id: Optional[str] = None, limit: int = 100):
+    db = _require_db()
+    pid = project_id or CURRENT_PROJECT_ID
+    docs = list(db.documents.find({"projectId": pid}, {"_id": 0})
+                .sort("createdAt", -1).limit(limit))
+    for d in docs:
+        d["createdAt"] = d["createdAt"].isoformat()
+    return {"documents": docs}
+
+
+@app.get("/api/db/daily-reports")
+def db_daily_reports(project_id: Optional[str] = None, limit: int = 60):
+    db = _require_db()
+    pid = project_id or CURRENT_PROJECT_ID
+    docs = list(db.daily_reports.find({"projectId": pid}, {"_id": 0})
+                .sort("createdAt", -1).limit(limit))
+    for d in docs:
+        d["createdAt"] = d["createdAt"].isoformat()
+    return {"reports": docs}
+
+
+@app.get("/api/db/activity-log")
+def db_activity(project_id: Optional[str] = None, limit: int = 200):
+    db = _require_db()
+    q = {"projectId": project_id or CURRENT_PROJECT_ID} if (project_id or CURRENT_PROJECT_ID) else {}
+    docs = list(db.activity_log.find(q, {"_id": 0}).sort("createdAt", -1).limit(limit))
+    for d in docs:
+        d["createdAt"] = d["createdAt"].isoformat()
+    return {"activity": docs}
 
 
 if __name__ == "__main__":
