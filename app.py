@@ -103,7 +103,12 @@ def get_db():
     try:
         from pymongo import MongoClient, ASCENDING, DESCENDING
 
-        _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000, tz_aware=False)
+        _mongo_client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            tz_aware=False,
+        )
         _mongo_client.admin.command("ping")
         _mongo_db = _mongo_client[MONGODB_DB]
         _mongo_db.projects.create_index([("updatedAt", DESCENDING)])
