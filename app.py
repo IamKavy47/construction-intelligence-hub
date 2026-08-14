@@ -6,6 +6,8 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 import requests
@@ -25,6 +27,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =====================================================================================
+# STATIC FILE SERVING (Frontend SPA)
+# Serve the built frontend from .output/public directory
+# =====================================================================================
+import pathlib
+
+frontend_build_dir = pathlib.Path(__file__).parent / ".output" / "public"
+if frontend_build_dir.exists():
+    app.mount("/assets", StaticFiles(directory=frontend_build_dir / "assets", check_dir=False), name="assets")
+    logger.info(f"Mounted /assets from {frontend_build_dir / 'assets'}")
 
 # =====================================================================================
 # GLOBAL STATE
@@ -2509,5 +2522,19 @@ def export_executive_summary():
     return _pdf_response(pdf, "executive-summary.pdf")
 
 
+@app.get("/")
+@app.get("/{path_name:path}")
+async def serve_spa(path_name: str = ""):
+    """Serve the SPA frontend from the build output. All non-API routes fall back to index.html."""
+    if path_name.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    index_file = frontend_build_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file, media_type="text/html")
+    raise HTTPException(status_code=404, detail="Frontend build not found. Run 'npm run build' in the frontend directory.")
+
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    host = os.getenv("HOST", "0.0.0.0")
+    uvicorn.run("app:app", host=host, port=port, reload=False)

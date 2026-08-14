@@ -1,0 +1,14 @@
+services:
+  cih:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cih
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    ports:
+      - "8001:8000"
+    restart: unless-stopped

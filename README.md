@@ -79,20 +79,20 @@ The project relies on an external MCP server. Clone it from the repository below
 
 ## Project Setup
 
-### 1. Clone & Prepare Environment
+### ⚙️ Environment Variables
+
+Before starting either deployment method (Docker or local), create a `.env` file at the project root (`/root/cih/.env`):
 
 ```bash
-cd /root/cih
-python -m venv .venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
+[ -f .env.example ] && cp .env.example .env || touch .env
+# then edit .env and add your real keys
 ```
 
-> `requirements.txt` includes FastAPI, Uvicorn, Pydantic, PyMongo, Qdrant client, FastEmbed, LangChain, ReportLab, python-docx, PyPDF, google-genai, and other dependencies.
+How `.env` is used:
+- Local run: loaded by `python-dotenv` from project root.
+- Docker run: pass it with `--env-file .env` (the file is not baked into the image).
 
-### 2. Configure Environment Variables
-
-Create a `.env` file at the project root (`/root/cih/.env`) with the following format:
+### Environment File Format
 
 ```env
 # --- AI Provider Keys ---
@@ -139,7 +139,7 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/...
 ```
 
-Frontend `.env` (`/root/cih/frontend/.env`):
+Frontend `.env` (`/root/cih/frontend/.env`) for local frontend dev:
 
 ```env
 # Backend base URL
@@ -153,7 +153,54 @@ SESSION_SECRET=change-me-to-a-long-random-string
 
 > Replace every placeholder (`your_*_here`) with your actual key. Do not commit real API keys to version control.
 
-### 3. Start the MCP Server
+### Run With Docker Compose (Recommended)
+
+This setup avoids the MCP port conflict by exposing CIH on host port `8001`.
+
+1. Build and start:
+
+```bash
+cd /root/cih
+docker compose up -d --build
+```
+
+2. Open the app:
+
+```text
+http://127.0.0.1:8001
+```
+
+3. Useful Docker Compose commands:
+
+```bash
+# view logs
+docker compose logs -f
+
+# show running services
+docker compose ps
+
+# restart service
+docker compose restart
+
+# stop containers (keep volumes)
+docker compose down
+
+# stop and remove volumes too
+docker compose down -v
+
+# open shell in app container
+docker compose exec cih sh
+
+# rebuild after code changes
+docker compose up -d --build
+```
+
+Optional: if your Docker installation uses the old command style, use
+`docker-compose` instead of `docker compose`.
+
+### Run Without Docker (Local Dev)
+
+### 1. Start the MCP Server (if your workflow needs it)
 
 The MCP server must be running before or alongside the backend.
 
@@ -168,17 +215,21 @@ python main.py
 
 > The tmux workflow below starts this automatically in pane 1.
 
-### 4. Start the Backend
+### 2. Start the Backend
 
 ```bash
 cd /root/cih
+python -m venv .venv
 source .venv/bin/activate
-uvicorn app:app --reload --port 8001
+pip install -r requirements.txt
+uvicorn app:app --reload --host 0.0.0.0 --port 8001
 ```
 
 Backend will be available at `http://127.0.0.1:8001`.
 
-### 5. Start the Frontend
+### 3. Start the Frontend (optional in dev mode)
+
+If you want Vite hot-reload during UI development:
 
 ```bash
 cd /root/cih/frontend
@@ -186,7 +237,26 @@ npm install
 npm run dev
 ```
 
-The frontend typically runs on `http://localhost:5173` and proxies API calls to `http://127.0.0.1:8001`.
+Then open `http://127.0.0.1:5173`.
+
+### 4. Build Frontend For Backend-Served Mode (optional)
+
+If you want the Python app to serve the built frontend itself:
+
+```bash
+cd /root/cih/frontend
+npm ci
+npm run build
+```
+
+Then run backend and open `http://127.0.0.1:8001`.
+
+### 5. Quick Health Check
+
+```bash
+curl -I http://127.0.0.1:8001
+curl http://127.0.0.1:8001/api/db/status
+```
 
 ---
 
@@ -221,7 +291,7 @@ tmux send-keys -t "$SESSION:Development.0" \
 # -------------------------------
 tmux split-window -h -t "$SESSION:Development"
 tmux send-keys -t "$SESSION:Development.1" \
-"cd /root/cih && source .venv/bin/activate && uv pip install -r requirements.txt && uvicorn app:app --reload --port 8001" C-m
+"cd /root/cih && source .venv/bin/activate && pip install -r requirements.txt && uvicorn app:app --reload --host 0.0.0.0 --port 8001" C-m
 
 # -------------------------------
 # Pane 3 (Bottom Right): Frontend (port 5173)
@@ -254,10 +324,17 @@ This opens three panes: MCP server, FastAPI backend with auto-reload, and the Vi
 | Service | Default Port | Configured In |
 |---------|--------------|---------------|
 | MCP Server | depends on `main.py` | `/root/mcpserver` |
-| FastAPI Backend | `8001` | `uvicorn` command |
+| FastAPI Backend | `8001` | `uvicorn` command / Docker Compose |
 | Vite Frontend | `5173` | `npm run dev` |
 
 ---
+
+## Start the Frontend
+
+```bash
+cd /root/cih/frontend
+npm run dev
+```
 
 ## Default Login
 
