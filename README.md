@@ -1,4 +1,4 @@
-# Construction Intelligence Hub (CIH)
+# Agentic AI For Safety Monitoring with Construction Risk Analytics
 
 > AI-powered construction project management platform that unifies risk, safety, materials, timeline, reporting, and executive insights into a single intelligent dashboard.
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-Construction Intelligence Hub is a full-stack application designed to act as a central AI brain for construction projects. Users create projects through an onboarding wizard, upload construction documents, and access intelligent modules powered by multiple AI providers.
+Agentic AI For Safety Monitoring with Construction Risk Analytics is a full-stack application designed to act as a central AI brain for construction projects. Users create projects through an onboarding wizard, upload construction documents, and access intelligent modules powered by multiple AI providers.
 
 The platform combines real-time weather intelligence, risk analysis, safety monitoring (including PPE image checks), material tracking, timeline optimization, daily AI-generated reports, and an executive command center. A multilingual construction copilot with voice input supports Indian languages via Sarvam AI speech-to-text.
 
